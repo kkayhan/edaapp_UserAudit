@@ -1,0 +1,8 @@
+FROM python:3.12-slim
+LABEL org.opencontainers.image.source="https://github.com/kkayhan/edaapp_UserAudit"
+LABEL org.opencontainers.image.description="EDA User Audit Controller"
+LABEL org.opencontainers.image.license="MIT"
+COPY controller/ /app/
+WORKDIR /app
+USER 65534
+CMD ["python3", "main.py"]

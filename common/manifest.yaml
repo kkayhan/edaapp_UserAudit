@@ -1,0 +1,15 @@
+apiVersion: core.eda.nokia.com/v1
+kind: Manifest
+metadata:
+  name: common
+spec:
+  # Minimal app manifest just to be able to run `edabuilder generate` as if this was an app.
+  appInfo:
+    categories:
+      - pymodel-generation-only
+  author: nokia
+  image: placeholder/placeholder:v0
+  version: v1alpha1
+  dependencies:
+    - file:
+        path: common/api/v1alpha1/pysrc

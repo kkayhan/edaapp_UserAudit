@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: eda-useraudit-fileserver
+  namespace: eda-system
+spec:
+  type: ClusterIP
+  selector:
+    eda.nokia.com/app: eda-useraudit
+  ports:
+    - name: http
+      port: 8080
+      targetPort: fileserver

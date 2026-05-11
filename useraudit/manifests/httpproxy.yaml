@@ -1,0 +1,7 @@
+apiVersion: core.eda.nokia.com/v1
+kind: HttpProxy
+metadata:
+  name: useraudit
+spec:
+  rootUrl: http://eda-useraudit-fileserver.eda-system.svc:8080/
+  authType: atDestination

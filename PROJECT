@@ -1,0 +1,5 @@
+builderVersion: v26.4.1
+domain: eda.edacommunity.com
+name: useraudit
+registry: ghcr.io/kkayhan/edaapp_UserAudit
+vendor: edacommunity
