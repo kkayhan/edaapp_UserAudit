@@ -14,7 +14,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "v0.7.0"
+VERSION = "v0.7.1"
 DATA_DIR = "/data/logs"
 NAMESPACE = os.environ.get("POD_NAMESPACE", "eda-system")
 CRD_GROUP = "useraudit.eda.edacommunity.com"

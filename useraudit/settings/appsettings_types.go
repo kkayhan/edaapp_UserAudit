@@ -6,19 +6,29 @@ import (
 
 // AppSettingsSpec defines the desired state of AppSettings.
 type AppSettingsSpec struct {
-	// Document the 'ControllerCpuLimit' setting here, so it shows up nicely in your generated OpenAPI spec.
+	// Maximum CPU the User Audit controller pod is allowed to use.
+	// Kubernetes CPU units: "200m" = 0.2 of one core, "1" = one full core.
+	// The default fits a small fabric. Raise this if you see audit logging
+	// fall behind during periods of heavy configuration change.
 	// +kubebuilder:default="200m"
-	// +eda:ui:title="ControllerCpuLimit"
+	// +eda:ui:title="Controller CPU limit"
 	ControllerCpuLimit string `json:"controllerCpuLimit,omitempty"`
 
-	// Document the 'ControllerMemoryLimit' setting here, so it shows up nicely in your generated OpenAPI spec.
+	// Maximum memory the User Audit controller pod is allowed to use.
+	// Kubernetes memory units: "128Mi" = 128 MiB, "1Gi" = 1 GiB.
+	// The default fits a small fabric. Raise this if the pod gets restarted
+	// with reason "OOMKilled" (visible in `kubectl describe pod` / pod status).
 	// +kubebuilder:default="128Mi"
-	// +eda:ui:title="ControllerMemoryLimit"
+	// +eda:ui:title="Controller memory limit"
 	ControllerMemoryLimit string `json:"controllerMemoryLimit,omitempty"`
 
-	// Document the 'LogStorageSize' setting here, so it shows up nicely in your generated OpenAPI spec.
+	// Disk space reserved on the persistent volume for monthly audit log
+	// files (Transaction-YYYY-MM.log). 500Mi typically holds many months of
+	// logs on a small or medium fabric. The volume is created once at install
+	// time and CANNOT be resized later from this setting -- pick a size with
+	// some headroom for your retention policy.
 	// +kubebuilder:default="500Mi"
-	// +eda:ui:title="LogStorageSize"
+	// +eda:ui:title="Audit log storage size"
 	LogStorageSize string `json:"logStorageSize,omitempty"`
 }
 
