@@ -1,38 +1,37 @@
 # EDA User Audit
 
-An EDA App that automatically logs every EDA configuration change and Keycloak authentication event into monthly audit log files. Logs are served over a read-only HTTP API and are visible in the EDA UI.
+A Nokia **EDA** app that turns the EDA cluster into a system-of-record for **who did what**. Once installed, it silently and continuously records:
 
-- **Repo:** https://github.com/kkayhan/edaapp_UserAudit
-- **Packages:** published to GHCR under the same account
-- **App ID:** `useraudit.eda.edacommunity.com`
-- **Category:** Monitoring
-- **Vendor:** EDACommunity
+- every **configuration change** made in EDA — the user who made it, when, from which IP address, and a human-readable diff of what changed on each device
+- every **sign-in and sign-out** to the EDA GUI
+- every **administrative change** in Keycloak (user / group / role management)
 
-## What It Logs
+All events are written to monthly log files (`Transaction-YYYY-MM.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint — no scraping, no parsing, no extra tooling.
 
-- **EDA transactions** — every configuration change, with user, source IP, timestamp, and a flattened per-device diff.
-- **Keycloak GUI sign-in / sign-out** — user login and logout events with username and source IP.
-- **Keycloak admin events** — user, group, client-role, and realm modifications performed through Keycloak.
-
-### Sample Log Output
+A typical line looks like this:
 
 ```
-2026-04-16T12:20:22 UTC | Event=Transaction-99 | User=admin | IPADDR=10.0.0.5 | Modified=Fabric | Namespace=default | Fabric resource named fabric1 has been updated.
+2026-04-20T08:41:00 UTC | Event=EDA-Login | User=admin | IPADDR=10.244.0.55 | The user signed-in to the EDA GUI.
+2026-04-20T07:26:09 UTC | Event=Transaction-101 | User=kubernetes | Modified=EDA | Namespace=eda | TargetNode resource named leaf2 has been created.
+2026-04-20T09:12:33 UTC | Event=Transaction-104 | User=alice | IPADDR=10.0.0.5 | Modified=Fabric | Namespace=default | Fabric resource named fabric1 has been updated.
    interface-ethernet/ethernet-1-1/admin-state: enable -> disable
-
-2026-04-16T12:22:40 UTC | Event=EDA-Login | User=admin | IPADDR=10.244.0.27 | The user signed-in to the EDA GUI.
+2026-04-20T11:05:14 UTC | Event=KC-Admin | User=admin | IPADDR=10.0.0.5 | Action=CREATE | Target=user | Detail=created user "bob".
 ```
 
-## Prerequisites
+Designed for compliance archives, SIEM feeds, change-management audits, and "who broke the fabric last Tuesday?" conversations.
 
-- EDA v25.12.x or later
-- The EDA cluster can reach `ghcr.io`
+---
 
-## Installation
+## Install (from the EDA UI)
 
-### Step 1 — Add the catalog
+There's nothing to configure. The app starts logging the moment it's installed.
 
-Apply a Catalog CR that points EDA at this repo:
+**Step 1 — Add this catalog to your EDA cluster (one-time):**
+
+1. In the EDA UI, go to **System Administration**.
+2. Under **APP Management**, open **Catalogs**.
+3. Click **Create** and paste the YAML below.
+4. **Commit**.
 
 ```yaml
 apiVersion: appstore.eda.nokia.com/v1
@@ -46,147 +45,70 @@ spec:
   title: Community EDA Apps
 ```
 
-```bash
-kubectl apply -f catalog.yaml
-```
+**Step 2 — Install from the Store:**
 
-### Step 2 — Install from the App Store
+Open the **App Store** in the EDA UI. "EDA User Audit" will appear under *Monitoring*. Click **Install**. That's it — no settings to fill in, no credentials to configure.
 
-Open the EDA GUI, go to the **App Store**, find **EDA User Audit** under *Monitoring*, and click **Install**.
+The controller starts immediately, enables Keycloak event auditing on your behalf, and begins writing the first log file within one poll cycle (default: 5 minutes).
 
-Or install via CLI:
+---
 
-```yaml
-apiVersion: appstore.eda.nokia.com/v1
-kind: AppInstaller
-metadata:
-  name: install-useraudit
-  namespace: eda-system
-spec:
-  operation: install
-  dryRun: false
-  apps:
-    - appId: useraudit.eda.edacommunity.com
-      catalog: community-apps
-      version:
-        type: semver
-        value: "v0.7.0"
-```
+## Where the logs are
+
+### Persistent storage
+
+Logs live on a `PersistentVolumeClaim` inside the cluster (`useraudit-data`, 500 MiB by default). Restarting the pod, upgrading the app, or rolling a node does **not** lose data. Uninstalling the app **does** — pull a copy first if you need to keep history.
+
+### HTTP endpoint
+
+Logs are served read-only over the EDA HttpProxy at `https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/`.
+
+**Step 1 — list the available log files.** A `GET` on `/logs/` returns a JSON array of every file currently on disk, with sizes and timestamps:
 
 ```bash
-kubectl apply -f install.yaml
+curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
 ```
 
-### Step 3 — Post-install setup
+```json
+[
+  {"name": "Transaction-2026-04.log", "size_bytes": 18432, "modified": "2026-04-30T23:59:00Z"},
+  {"name": "Transaction-2026-05.log", "size_bytes":  4221, "modified": "2026-05-04T08:14:12Z"}
+]
+```
 
-Create the default configuration:
+**Step 2 — download a specific file.** Append the `name` from the listing to the URL:
 
 ```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: useraudit.eda.edacommunity.com/v1alpha1
-kind: UserAuditConfig
-metadata:
-  name: default
-spec:
-  pollIntervalSeconds: 300
-  retentionMonths: 0
-EOF
+curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/Transaction-2026-05.log
 ```
 
-### Step 4 — Verify
+### Helper script
+
+[`logs/pull-audit-logs.sh`](logs/pull-audit-logs.sh) wraps both steps so you can grab everything in one command. Pure `bash` + `curl`, no other dependencies:
 
 ```bash
-kubectl -n eda-system get pods -l eda.nokia.com/app=eda-useraudit
-curl -sk https://<eda-address>/core/httpproxy/v1/useraudit/healthz
+# Download every log file into the current directory
+./pull-audit-logs.sh https://<your-eda-host>
+
+# Download every log file into ./audit-archive
+./pull-audit-logs.sh https://<your-eda-host> ./audit-archive
+
+# Download a single named file
+./pull-audit-logs.sh https://<your-eda-host> ./audit-archive Transaction-2026-05.log
 ```
 
-## Usage
-
-All endpoints are reached via the EDA HttpProxy:
-
-```
-https://<eda-address>/core/httpproxy/v1/useraudit/
-```
-
-| Endpoint | Description |
-|----------|-------------|
-| `/healthz` | Health status and last poll time |
-| `/logs/` | List log files with sizes and timestamps (JSON) |
-| `/logs/<filename>` | Download a specific log file (plain text) |
+### Health check
 
 ```bash
-EDA=https://<eda-address>
-BASE=$EDA/core/httpproxy/v1/useraudit
-
-curl -sk $BASE/healthz
-curl -sk $BASE/logs/
-curl -sk $BASE/logs/EDA-user-events-2026-05.log
+curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/healthz
 ```
 
-## Configuration
+Returns a JSON object with overall status, last poll time, last transaction ID processed, and per-subsystem health for the EDA API and Keycloak event feeds.
 
-### UserAuditConfig CRD
+---
 
-```bash
-kubectl edit userauditconfig default
-```
+## What it does NOT do
 
-| Field | Default | Range | Description |
-|-------|---------|-------|-------------|
-| `pollIntervalSeconds` | 300 | 60–3600 | Polling interval in seconds |
-| `retentionMonths` | 0 | 0+ | Months of logs to keep (0 = unlimited) |
-
-### App settings (install-time)
-
-Adjustable from the EDA App Store settings panel:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `controllerCpuLimit` | 200m | CPU limit |
-| `controllerMemoryLimit` | 128Mi | Memory limit |
-| `logStorageSize` | 500Mi | PVC size for log storage |
-
-## Uninstalling
-
-```yaml
-apiVersion: appstore.eda.nokia.com/v1
-kind: AppInstaller
-metadata:
-  name: uninstall-useraudit
-  namespace: eda-system
-spec:
-  operation: delete
-  dryRun: false
-  apps:
-    - appId: useraudit.eda.edacommunity.com
-      catalog: community-apps
-```
-
-Or remove it via the App Store UI.
-
-## Build from source
-
-Requires `edabuilder` (ships in the EDA toolbox pod).
-
-```bash
-# Authenticate once
-edabuilder login registry ghcr.io -u <gh-user> -p <gh-pat>          # PAT: write:packages
-
-# Build and push OCI packages to GHCR
-edabuilder build-push --app manifest=useraudit/manifest.yaml
-
-# Publish the catalog entry to this repo
-edabuilder login git -u <gh-user> -p <gh-pat> \
-  https://github.com/kkayhan/edaapp_UserAudit.git
-edabuilder publish https://github.com/kkayhan/edaapp_UserAudit.git \
-  --app manifest=useraudit/manifest.yaml
-```
-
-For dev iteration against a local EDA cluster, `edabuilder deploy --app useraudit` pushes to the in-cluster registry and creates an AppInstaller.
-
-## Troubleshooting
-
-- **Pod in `ImagePullBackOff`** — verify the cluster can reach `ghcr.io`. Images are public; no auth needed.
-- **Health reports `degraded` / `error`** — `kubectl get userauditconfig default -o yaml` plus pod logs.
-- **No logs appear** — the controller auto-discovers the latest transaction ID on first start and logs new events going forward. Make a change in EDA and wait for the next poll cycle.
-- **HttpProxy 404** — verify the HttpProxy CR: `kubectl get httpproxies.core.eda.nokia.com useraudit`.
+- Does **not** forward logs to external systems (syslog / SIEM / S3). Pull logs over HTTP into whatever system you already run.
+- Does **not** require (or accept) any credentials — it reads existing Kubernetes secrets inside the cluster.
+- Does **not** filter log access per user. Anyone authenticated to EDA can read the audit log.
