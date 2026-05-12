@@ -13,9 +13,8 @@ A typical line looks like this:
 ```
 2026-04-20T08:41:00 UTC | Event=EDA-Login | User=admin | IPADDR=10.244.0.55 | The user signed-in to the EDA GUI.
 2026-04-20T07:26:09 UTC | Event=Transaction-101 | User=kubernetes | Modified=EDA | Namespace=eda | TargetNode resource named leaf2 has been created.
-2026-04-20T09:12:33 UTC | Event=Transaction-104 | User=alice | IPADDR=10.0.0.5 | Modified=Fabric | Namespace=default | Fabric resource named fabric1 has been updated.
-   interface-ethernet/ethernet-1-1/admin-state: enable -> disable
-2026-04-20T11:05:14 UTC | Event=KC-Admin | User=admin | IPADDR=10.0.0.5 | Action=CREATE | Target=user | Detail=created user "bob".
+2026-05-12T19:49:21 UTC | Event=Transaction-230 | User=admin | IPADDR=10.244.0.1 | Modified=d-bl1 | Namespace=demo | (+)interface/ethernet-1/1/description client555
+2026-05-12T19:49:21 UTC | Event=Transaction-230 | User=admin | IPADDR=10.244.0.1 | Modified=d-bl1 | Namespace=demo | (-)interface/ethernet-1/1/description client123
 ```
 
 Designed for compliance archives, SIEM feeds, change-management audits, and "who broke the fabric last Tuesday?" conversations.
