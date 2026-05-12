@@ -107,6 +107,88 @@ Returns a JSON object with overall status, last poll time, last transaction ID p
 
 ---
 
+## Seeing the real user IP in the logs
+
+You may notice the `IPADDR` field in your audit log shows a cluster-internal address (typically `10.244.0.1`) instead of the real laptop / browser IP of the user. **This is not an app bug** — it's a property of how Kubernetes routes external traffic. Fixing it is a cluster-admin task. This chapter explains why and what to do.
+
+### Why the IP gets lost
+
+When a user signs in from a browser, the packet travels:
+
+```
+laptop  →  cluster VIP  →  kube-proxy  →  eda-api pod  →  Keycloak pod
+```
+
+The "source IP" on the packet gets rewritten twice along the way:
+
+1. **kube-proxy SNAT.** Kubernetes Services default to `externalTrafficPolicy: Cluster`, which rewrites the source IP to an internal gateway address (`10.244.0.1`) so reply packets find their way back.
+2. **Pod-to-pod forwarding.** Even if Step 1 preserved the IP, `eda-api` re-issues the request to Keycloak internally — the source address becomes `eda-api`'s own pod IP.
+
+By the time Keycloak logs the event, the real client IP is gone from the TCP packet. The only place to recover it is the HTTP `X-Forwarded-For` header — but something at the cluster edge has to *add* that header in the first place. Vanilla EDA doesn't ship anything that does.
+
+The Nokia EDA docs ([Exposing the UI/API](https://docs.eda.dev/software-install/exposing-ui-api/)) state plainly:
+
+> "Ingress controllers are not part of Nokia EDA installation, and are typically managed by the cluster administrator."
+
+So for any cluster where audit logs need to show real user IPs, the cluster admin must install an Ingress controller. Nokia documents two options — [Ingress NGINX](https://kubernetes.github.io/ingress-nginx/) and the [Gateway API](https://gateway-api.sigs.k8s.io/) — but only Ingress NGINX has a ready-to-apply Nokia kpt package (`eda-api-ingress-https`). The rest of this chapter assumes Ingress NGINX.
+
+### What needs to be true
+
+For a real user IP to land in the audit log, all five of these have to be in place:
+
+| # | Piece | What it does |
+|---|---|---|
+| 1 | **ingress-nginx** Helm chart with `externalTrafficPolicy: Local` | HTTP-aware proxy at the cluster edge. Reads the real client IP off the TCP socket and stamps it into `X-Forwarded-For`. `Local` keeps kube-proxy from rewriting the IP on the way in. |
+| 2 | Nokia **`eda-api-ingress-https`** kpt package applied | Provides the `Ingress` resource + TLS Cert that route UI traffic through ingress-nginx. Ships under `eda-kpt/eda-external-packages/`. |
+| 3 | **`EngineConfig.spec.cluster.external.proxyMode: XForward`** | Tells EDA to start Keycloak with `--proxy-headers=xforwarded`, so Keycloak trusts the header instead of the TCP source IP. |
+| 4 | MetalLB pool with **`autoAssign: false`** | Stops `eda-api` from claiming the cluster's single VIP, so ingress-nginx can claim it instead via `controller.service.loadBalancerIP=<VIP>`. |
+| 5 | App-layer filter `clientId == "auth"` when matching LOGIN events to transactions | Skips the controller's own service-account logins so it doesn't self-attribute its own pod IP. **Already in this app since v0.8.0 — nothing for you to do.** |
+
+Pieces 1 through 4 are cluster-admin tasks. Skipping any one of them breaks the chain.
+
+### ingress-nginx Helm install — four mandatory values
+
+```bash
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.service.externalTrafficPolicy=Local \
+  --set controller.service.loadBalancerIP=<your-VIP> \
+  --set controller.config.annotations-risk-level=Critical \
+  --set controller.allowSnippetAnnotations=true
+```
+
+The last two are **not optional**. The Nokia Ingress uses a `server-snippet` annotation to enlarge Keycloak's HTTP header buffer (OAuth tokens are big). Modern ingress-nginx (≥ v1.10) classifies that annotation as Critical risk and **silently drops the entire Ingress** unless you whitelist it. Symptom if you forget: `nginx.conf` has zero references to `eda-api` and every request returns the default-backend 404.
+
+Also, before `kubectl apply`-ing the kpt package, strip the empty IPv6 placeholder from the Cert YAML — cert-manager rejects empty strings in `spec.ipAddresses`:
+
+```bash
+yq eval '(.spec.ipAddresses // []) |= map(select(. != ""))' -i eda-api-ingress-cert.yaml
+```
+
+### Kind-based clusters
+
+- Kind runs as Docker containers on the host. The five-piece chain above applies as-is.
+- `EngineConfig.proxyMode` is **not** set to `XForward` by default on a Kind install. Either add it to your kpt-setters before installing EDA, or set it on the live `EngineConfig` afterwards.
+- No hypervisor in the path → no extra host-level NAT to worry about.
+
+### Talos-based clusters
+
+- Talos runs inside a VM on a hypervisor. The default Nokia kpt-setters already include `EXT_PROXY_MODE=XForward`, so piece **3** is done out of the box. You still need pieces **1, 2, and 4**.
+- **Do not** set `EngineConfig.spec.api.serviceType: ClusterIP` as a shortcut on EDA 26.4.1. The api-server reconciler unconditionally writes `allocateLoadBalancerNodePorts: false` onto the Service, which Kubernetes rejects on non-`LoadBalancer` types, looping the reconciler forever and blocking the install. The MetalLB `autoAssign: false` approach is correct — `eda-api` stays `type: LoadBalancer`, goes `EXTERNAL-IP=<pending>`, and is still reachable via its ClusterIP for ingress-nginx backend traffic.
+- For clients connecting from VPN-range source IPs, also set `MASQUERADE_SKIP_SOURCES=10.0.0.0/8` on the hypervisor and add a return route on the Talos node, otherwise the hypervisor's MetalLB-VIP MASQUERADE rule rewrites VPN source IPs before they ever reach the cluster.
+
+### Verifying it worked
+
+After all four cluster-admin pieces are in place, sign in fresh from a browser and pull the latest log file using the helper script:
+
+```bash
+./pull-audit-logs.sh https://<your-eda-host> . && tail -5 *-$(date +%Y-%m).log
+```
+
+The `IPADDR` field on the new login event should show your real browser IP — not `10.244.0.x`.
+
+---
+
 ## What it does NOT do
 
 - Does **not** forward logs to external systems (syslog / SIEM / S3). Pull logs over HTTP into whatever system you already run.
