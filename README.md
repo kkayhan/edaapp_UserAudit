@@ -173,9 +173,8 @@ yq eval '(.spec.ipAddresses // []) |= map(select(. != ""))' -i eda-api-ingress-c
 
 ### Talos-based clusters
 
-- Talos runs inside a VM on a hypervisor. The default Nokia kpt-setters already include `EXT_PROXY_MODE=XForward`, so piece **3** is done out of the box. You still need pieces **1, 2, and 4**.
+- The default Nokia kpt-setters for Talos already include `EXT_PROXY_MODE=XForward`, so piece **3** is done out of the box. You still need pieces **1, 2, and 4**.
 - **Do not** set `EngineConfig.spec.api.serviceType: ClusterIP` as a shortcut on EDA 26.4.1. The api-server reconciler unconditionally writes `allocateLoadBalancerNodePorts: false` onto the Service, which Kubernetes rejects on non-`LoadBalancer` types, looping the reconciler forever and blocking the install. The MetalLB `autoAssign: false` approach is correct — `eda-api` stays `type: LoadBalancer`, goes `EXTERNAL-IP=<pending>`, and is still reachable via its ClusterIP for ingress-nginx backend traffic.
-- For clients connecting from VPN-range source IPs, also set `MASQUERADE_SKIP_SOURCES=10.0.0.0/8` on the hypervisor and add a return route on the Talos node, otherwise the hypervisor's MetalLB-VIP MASQUERADE rule rewrites VPN source IPs before they ever reach the cluster.
 
 ### Verifying it worked
 
