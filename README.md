@@ -109,45 +109,32 @@ Returns a JSON object with overall status, last poll time, last transaction ID p
 
 ## Seeing the real user IP in the logs
 
-You may notice the `IPADDR` field in your audit log shows a cluster-internal address (typically `10.244.0.1`) instead of the real laptop / browser IP of the user. **This is not an app bug** — it's a property of how Kubernetes routes external traffic. Fixing it is a cluster-admin task. This chapter explains why and what to do.
+By default the `IPADDR` field in your audit log shows a cluster-internal address (typically `10.244.0.1`) instead of the real laptop / browser IP. **This is not an app bug.** Two normal Kubernetes behaviors erase the source IP before Keycloak sees the request:
 
-### Why the IP gets lost
+1. **kube-proxy SNAT.** Services default to `externalTrafficPolicy: Cluster`, which rewrites the source IP to an internal gateway (`10.244.0.1`) so reply packets find their way back.
+2. **Pod-to-pod forwarding.** `eda-api` re-issues the request internally to Keycloak — the source becomes `eda-api`'s own pod IP.
 
-When a user signs in from a browser, the packet travels:
-
-```
-laptop  →  cluster VIP  →  kube-proxy  →  eda-api pod  →  Keycloak pod
-```
-
-The "source IP" on the packet gets rewritten twice along the way:
-
-1. **kube-proxy SNAT.** Kubernetes Services default to `externalTrafficPolicy: Cluster`, which rewrites the source IP to an internal gateway address (`10.244.0.1`) so reply packets find their way back.
-2. **Pod-to-pod forwarding.** Even if Step 1 preserved the IP, `eda-api` re-issues the request to Keycloak internally — the source address becomes `eda-api`'s own pod IP.
-
-By the time Keycloak logs the event, the real client IP is gone from the TCP packet. The only place to recover it is the HTTP `X-Forwarded-For` header — but something at the cluster edge has to *add* that header in the first place. Vanilla EDA doesn't ship anything that does.
-
-The Nokia EDA docs ([Exposing the UI/API](https://docs.eda.dev/software-install/exposing-ui-api/)) state plainly:
+The real client IP can only survive end-to-end as an HTTP `X-Forwarded-For` header — but **vanilla EDA doesn't ship anything that injects that header.** Nokia is explicit about this in [Exposing the UI/API](https://docs.eda.dev/software-install/exposing-ui-api/):
 
 > "Ingress controllers are not part of Nokia EDA installation, and are typically managed by the cluster administrator."
 
-So for any cluster where audit logs need to show real user IPs, the cluster admin must install an Ingress controller. Nokia documents two options — [Ingress NGINX](https://kubernetes.github.io/ingress-nginx/) and the [Gateway API](https://gateway-api.sigs.k8s.io/) — but only Ingress NGINX has a ready-to-apply Nokia kpt package (`eda-api-ingress-https`). The rest of this chapter assumes Ingress NGINX.
+The fix is for you, the cluster admin, to install an Ingress controller in front of `eda-api`. Nokia ships a kpt package for [Ingress NGINX](https://kubernetes.github.io/ingress-nginx/) — that's what these steps use. The procedure differs slightly between Kind and Talos installs; pick your section.
 
-### What needs to be true
+---
 
-For a real user IP to land in the audit log, all four of these have to be in place:
+### Kind-based clusters
 
-| # | Piece | What it does |
-|---|---|---|
-| 1 | **ingress-nginx** Helm chart with `externalTrafficPolicy: Local` | HTTP-aware proxy at the cluster edge. Reads the real client IP off the TCP socket and stamps it into `X-Forwarded-For`. `Local` keeps kube-proxy from rewriting the IP on the way in. |
-| 2 | Nokia **`eda-api-ingress-https`** kpt package applied | Provides the `Ingress` resource + TLS Cert that route UI traffic through ingress-nginx. Ships under `eda-kpt/eda-external-packages/`. |
-| 3 | **`EngineConfig.spec.cluster.external.proxyMode: XForward`** | Tells EDA to start Keycloak with `--proxy-headers=xforwarded`, so Keycloak trusts the header instead of the TCP source IP. |
-| 4 | MetalLB pool with **`autoAssign: false`** | Stops `eda-api` from claiming the cluster's single VIP, so ingress-nginx can claim it instead via `controller.service.loadBalancerIP=<VIP>`. |
+Four steps, ~10 minutes end-to-end on a working Kind cluster.
 
-All four are cluster-admin tasks. Skipping any one of them breaks the chain.
+#### Step 1 — Install ingress-nginx
 
-### ingress-nginx Helm install — four mandatory values
+**What:** an HTTP-aware proxy at the cluster edge that reads the real client IP off the TCP socket and stamps it into `X-Forwarded-For`.
+
+**Where:** on the Kind cluster, via Helm. Run from any host with `helm` + `kubectl` pointing at the cluster.
 
 ```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
 helm install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx --create-namespace \
   --set controller.service.externalTrafficPolicy=Local \
@@ -156,34 +143,190 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
   --set controller.allowSnippetAnnotations=true
 ```
 
-The last two are **not optional**. The Nokia Ingress uses a `server-snippet` annotation to enlarge Keycloak's HTTP header buffer (OAuth tokens are big). Modern ingress-nginx (≥ v1.10) classifies that annotation as Critical risk and **silently drops the entire Ingress** unless you whitelist it. Symptom if you forget: `nginx.conf` has zero references to `eda-api` and every request returns the default-backend 404.
+`<your-VIP>` is the external IP your EDA UI resolves to. All four `--set` values are mandatory:
 
-Also, before `kubectl apply`-ing the kpt package, strip the empty IPv6 placeholder from the Cert YAML — cert-manager rejects empty strings in `spec.ipAddresses`:
+| Value | Why |
+|---|---|
+| `externalTrafficPolicy=Local` | Tells kube-proxy NOT to SNAT incoming traffic — otherwise the real client IP gets rewritten before ingress-nginx ever sees it. |
+| `loadBalancerIP=<your-VIP>` | Tells MetalLB to assign your specific VIP to ingress-nginx (claimed back from `eda-api` in Step 2). |
+| `annotations-risk-level=Critical` + `allowSnippetAnnotations=true` | Nokia's Ingress uses a `server-snippet` annotation to enlarge Keycloak's HTTP header buffer (OAuth tokens are big). Modern ingress-nginx (≥ v1.10) classifies this annotation as "Critical risk" and **silently drops the entire Ingress** unless you whitelist it. Symptom if you forget: `nginx.conf` has zero references to `eda-api`, every request returns the default-backend 404. |
+
+Verify the controller comes up:
 
 ```bash
-yq eval '(.spec.ipAddresses // []) |= map(select(. != ""))' -i eda-api-ingress-cert.yaml
+kubectl -n ingress-nginx get pods
+kubectl -n ingress-nginx get svc ingress-nginx-controller
 ```
 
-### Kind-based clusters
+The Service shows `EXTERNAL-IP=<pending>` for now — Step 2 frees the VIP for it.
 
-- Kind runs as Docker containers on the host. The five-piece chain above applies as-is.
-- `EngineConfig.proxyMode` is **not** set to `XForward` by default on a Kind install. Either add it to your kpt-setters before installing EDA, or set it on the live `EngineConfig` afterwards.
-- No hypervisor in the path → no extra host-level NAT to worry about.
+#### Step 2 — Free the VIP from `eda-api`
 
-### Talos-based clusters
+**What:** by default `eda-api` claims the cluster's single VIP via MetalLB. ingress-nginx needs that VIP. Setting the MetalLB pool to `autoAssign: false` means MetalLB only allocates the VIP to Services that explicitly request it via `loadBalancerIP` — ingress-nginx does (Step 1), `eda-api` doesn't.
 
-- The default Nokia kpt-setters for Talos already include `EXT_PROXY_MODE=XForward`, so piece **3** is done out of the box. You still need pieces **1, 2, and 4**.
-- **Do not** set `EngineConfig.spec.api.serviceType: ClusterIP` as a shortcut on EDA 26.4.1. The api-server reconciler unconditionally writes `allocateLoadBalancerNodePorts: false` onto the Service, which Kubernetes rejects on non-`LoadBalancer` types, looping the reconciler forever and blocking the install. The MetalLB `autoAssign: false` approach is correct — `eda-api` stays `type: LoadBalancer`, goes `EXTERNAL-IP=<pending>`, and is still reachable via its ClusterIP for ingress-nginx backend traffic.
+**Where:** patch the MetalLB IPAddressPool that owns your VIP (commonly named `kind` from `playground/configs/metallb-config-defaultPool.yaml`):
 
-### Verifying it worked
+```bash
+kubectl -n metallb-system patch ipaddresspool kind --type merge \
+  -p '{"spec":{"autoAssign":false}}'
+```
 
-After all four cluster-admin pieces are in place, sign in fresh from a browser and pull the latest log file using the helper script:
+If `eda-api` already holds the VIP (existing install), force MetalLB to re-evaluate by deleting and re-applying the Service so it loses its `loadBalancer.ingress` allocation:
+
+```bash
+kubectl -n eda-system get svc eda-api -o yaml > /tmp/eda-api.yaml
+kubectl -n eda-system delete svc eda-api
+kubectl apply -f /tmp/eda-api.yaml
+```
+
+Verify the new state:
+
+```bash
+kubectl -n eda-system get svc eda-api                      # EXTERNAL-IP=<pending>
+kubectl -n ingress-nginx get svc ingress-nginx-controller  # EXTERNAL-IP=<your-VIP>
+```
+
+`eda-api` in `<pending>` is the correct final state — it's still reachable on its ClusterIP, which is all ingress-nginx needs for backend traffic.
+
+#### Step 3 — Apply Nokia's `eda-api-ingress-https` kpt package
+
+**What:** the `Ingress` resource and TLS Cert that route UI traffic from ingress-nginx into `eda-api`. The Ingress also carries the `server-snippet` annotation that Step 1 whitelisted.
+
+**Where:** the package ships under `eda-kpt/eda-external-packages/eda-api-ingress-https/` in your EDA playground checkout (commonly `/root/eda/playground/...`).
+
+Strip the empty IPv6 placeholder from the Cert YAML first — cert-manager rejects `""` entries in `spec.ipAddresses`:
+
+```bash
+cd <eda-playground>/eda-kpt/eda-external-packages/eda-api-ingress-https
+yq eval '(.spec.ipAddresses // []) |= map(select(. != ""))' -i eda-api-ingress-cert.yaml
+kubectl apply -f .
+```
+
+Wait for the cert to issue (usually ~30s):
+
+```bash
+kubectl -n eda-system get certificate eda-api-ingress-cert -w
+# Expect READY=True
+```
+
+#### Step 4 — Enable `XForward` mode on `EngineConfig`
+
+**What:** tells EDA's reconciler to start Keycloak with `--proxy-headers=xforwarded`, so Keycloak trusts the `X-Forwarded-For` header from ingress-nginx instead of using the TCP source IP.
+
+**Where:** on Kind this is **not** set by default. Patch the live `EngineConfig`:
+
+```bash
+kubectl -n eda-system patch engineconfig engine-config --type merge \
+  -p '{"spec":{"cluster":{"external":{"proxyMode":"XForward"}}}}'
+```
+
+EDA's reconciler picks this up and rolls Keycloak with the new flag within ~30s. Confirm:
+
+```bash
+kubectl -n eda-system get pods | grep -i keycloak
+kubectl -n eda-system describe pod <keycloak-pod> | grep -i 'proxy-headers'
+# Expect: --proxy-headers=xforwarded
+```
+
+For a fresh install, set `EXT_PROXY_MODE=XForward` in `playground/configs/kpt-setters.yaml` before running `make eda-install-apps` — the kpt render bakes it in.
+
+#### Verify on Kind
+
+Sign in fresh from a browser, then pull the latest audit log:
 
 ```bash
 ./pull-audit-logs.sh https://<your-eda-host> . && tail -5 *-$(date +%Y-%m).log
 ```
 
-The `IPADDR` field on the new login event should show your real browser IP — not `10.244.0.x`.
+The `IPADDR` field on the new `EDA-Login` event should be your real browser IP — not `10.244.0.x`.
+
+---
+
+### Talos-based clusters
+
+Same four-piece chain as Kind, with two Talos-specific shortcuts:
+
+- **Step 4 is already done.** Nokia's default kpt-setters for Talos installs include `EXT_PROXY_MODE=XForward`, so Keycloak is already running with `--proxy-headers=xforwarded`.
+- **There's a Step 2 trap on EDA 26.4.1** (an attractive-looking shortcut that breaks core install).
+
+#### Step 1 — Install ingress-nginx
+
+Identical to Kind. From a host with `helm` + `kubectl` pointing at the Talos cluster:
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.service.externalTrafficPolicy=Local \
+  --set controller.service.loadBalancerIP=<your-VIP> \
+  --set controller.config.annotations-risk-level=Critical \
+  --set controller.allowSnippetAnnotations=true
+```
+
+The four mandatory `--set` values and their reasons are the same as the Kind Step 1 table above.
+
+Verify:
+
+```bash
+kubectl -n ingress-nginx get pods
+kubectl -n ingress-nginx get svc ingress-nginx-controller    # EXTERNAL-IP=<pending> until Step 2
+```
+
+#### Step 2 — Free the VIP from `eda-api`
+
+Same approach as Kind: patch the MetalLB pool, then force `eda-api` to release its existing allocation.
+
+```bash
+kubectl -n metallb-system patch ipaddresspool <pool-name> --type merge \
+  -p '{"spec":{"autoAssign":false}}'
+
+kubectl -n eda-system get svc eda-api -o yaml > /tmp/eda-api.yaml
+kubectl -n eda-system delete svc eda-api
+kubectl apply -f /tmp/eda-api.yaml
+```
+
+**Trap to avoid:** don't take the shortcut of setting `EngineConfig.spec.api.serviceType: ClusterIP`. On EDA 26.4.1 the api-server reconciler unconditionally writes `allocateLoadBalancerNodePorts: false` onto the Service. Kubernetes rejects that field on non-`LoadBalancer` types ("Forbidden: may only be used when type is 'LoadBalancer'"), the reconciler loops forever, and core install gets stuck. Stick with MetalLB `autoAssign: false` — `eda-api` stays `type: LoadBalancer` (in `<pending>` state) and ingress-nginx claims the VIP cleanly.
+
+Verify:
+
+```bash
+kubectl -n eda-system get svc eda-api                      # EXTERNAL-IP=<pending>
+kubectl -n ingress-nginx get svc ingress-nginx-controller  # EXTERNAL-IP=<your-VIP>
+```
+
+#### Step 3 — Apply Nokia's `eda-api-ingress-https` kpt package
+
+Identical to Kind. Strip the empty IPv6 from the Cert (cert-manager rejects `""`), then apply:
+
+```bash
+cd <eda-playground>/eda-kpt/eda-external-packages/eda-api-ingress-https
+yq eval '(.spec.ipAddresses // []) |= map(select(. != ""))' -i eda-api-ingress-cert.yaml
+kubectl apply -f .
+kubectl -n eda-system get certificate eda-api-ingress-cert -w    # READY=True
+```
+
+#### Step 4 — Confirm `XForward` is set (no action needed)
+
+Talos kpt-setters default to `EXT_PROXY_MODE=XForward`, so Keycloak is already configured. Verify:
+
+```bash
+kubectl -n eda-system get engineconfig engine-config -o yaml \
+  | grep -A2 'external:'
+# Expect to see:    proxyMode: XForward
+```
+
+If for any reason it isn't there (custom kpt-setters?), apply the same patch shown in Kind Step 4.
+
+#### Verify on Talos
+
+Sign in fresh from a browser, then:
+
+```bash
+./pull-audit-logs.sh https://<your-eda-host> . && tail -5 *-$(date +%Y-%m).log
+```
+
+`IPADDR` on the new `EDA-Login` event should be your real browser IP — not `10.244.0.x`.
 
 ---
 
