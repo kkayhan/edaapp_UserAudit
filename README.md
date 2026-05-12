@@ -134,7 +134,7 @@ So for any cluster where audit logs need to show real user IPs, the cluster admi
 
 ### What needs to be true
 
-For a real user IP to land in the audit log, all five of these have to be in place:
+For a real user IP to land in the audit log, all four of these have to be in place:
 
 | # | Piece | What it does |
 |---|---|---|
@@ -142,9 +142,8 @@ For a real user IP to land in the audit log, all five of these have to be in pla
 | 2 | Nokia **`eda-api-ingress-https`** kpt package applied | Provides the `Ingress` resource + TLS Cert that route UI traffic through ingress-nginx. Ships under `eda-kpt/eda-external-packages/`. |
 | 3 | **`EngineConfig.spec.cluster.external.proxyMode: XForward`** | Tells EDA to start Keycloak with `--proxy-headers=xforwarded`, so Keycloak trusts the header instead of the TCP source IP. |
 | 4 | MetalLB pool with **`autoAssign: false`** | Stops `eda-api` from claiming the cluster's single VIP, so ingress-nginx can claim it instead via `controller.service.loadBalancerIP=<VIP>`. |
-| 5 | App-layer filter `clientId == "auth"` when matching LOGIN events to transactions | Skips the controller's own service-account logins so it doesn't self-attribute its own pod IP. **Already in this app since v0.8.0 — nothing for you to do.** |
 
-Pieces 1 through 4 are cluster-admin tasks. Skipping any one of them breaks the chain.
+All four are cluster-admin tasks. Skipping any one of them breaks the chain.
 
 ### ingress-nginx Helm install — four mandatory values
 
