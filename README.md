@@ -191,7 +191,7 @@ kubectl -n ingress-nginx get svc ingress-nginx-controller  # EXTERNAL-IP=<your-V
 
 **What:** the `Ingress` resource and TLS Cert that route UI traffic from ingress-nginx into `eda-api`. The Ingress also carries the `server-snippet` annotation that Step 1 whitelisted.
 
-**Where:** the package ships under `eda-kpt/eda-external-packages/eda-api-ingress-https/` in your EDA playground checkout (commonly `/root/eda/playground/...`).
+**Where:** the package ships under `eda-kpt/eda-external-packages/eda-api-ingress-https/` in your EDA playground checkout (commonly `/home/kkayhan/eda/playground/...`).
 
 Strip the empty IPv6 placeholder from the Cert YAML first — cert-manager rejects `""` entries in `spec.ipAddresses`:
 
@@ -313,7 +313,7 @@ kubectl -n ingress-nginx get svc ingress-nginx-controller  # EXTERNAL-IP=<your-V
 
 **What:** the `Ingress` resource and TLS Cert that route UI traffic from ingress-nginx into `eda-api`. The Ingress also carries the `server-snippet` annotation that Step 1 whitelisted.
 
-**Where:** the package ships under `eda-kpt/eda-external-packages/eda-api-ingress-https/` in your EDA playground checkout (commonly `/root/eda/playground/...`).
+**Where:** the package ships under `eda-kpt/eda-external-packages/eda-api-ingress-https/` in your EDA playground checkout (commonly `/home/kkayhan/eda/playground/...`).
 
 Strip the empty IPv6 placeholder from the Cert YAML first — cert-manager rejects `""` entries in `spec.ipAddresses`:
 
