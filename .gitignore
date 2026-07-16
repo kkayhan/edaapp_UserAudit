@@ -4,3 +4,6 @@
 
 .vscode
 private
+
+__pycache__/
+*.pyc

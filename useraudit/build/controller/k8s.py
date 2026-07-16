@@ -91,6 +91,27 @@ def update_configmap(name, namespace, data_dict, resource_version):
     return _request("PUT", path, body)
 
 
+def create_or_update_secret(name, namespace, string_data, secret_type="Opaque"):
+    """Create the secret, or replace it in place if it already exists (idempotent).
+    string_data values are plaintext; the API server base64-encodes them."""
+    base = f"/api/v1/namespaces/{quote(namespace, safe='')}/secrets"
+    one = f"{base}/{quote(name, safe='')}"
+    resource_version = None
+    try:
+        existing = _request("GET", one)
+        resource_version = (existing.get("metadata") or {}).get("resourceVersion")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    metadata = {"name": name, "namespace": namespace}
+    body = {"apiVersion": "v1", "kind": "Secret", "metadata": metadata,
+            "type": secret_type, "stringData": string_data}
+    if resource_version is None:
+        return _request("POST", base, body)
+    metadata["resourceVersion"] = resource_version
+    return _request("PUT", one, body)
+
+
 def read_cr(group, version, plural, name):
     path = f"/apis/{group}/{version}/{plural}/{quote(name, safe='')}"
     try:

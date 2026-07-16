@@ -430,13 +430,22 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
 
 
 def discover_current_watermark():
-    """On first run, discover the highest transaction ID from the summary API."""
+    """On first run, discover the highest transaction ID so auditing starts from
+    "now" (new transactions only) instead of replaying all history.
+
+    Call the summary LIST endpoint with `?size=1` ONLY. The `page` query param
+    does NOT exist on EDA 26.4.1's `core/transaction/v2/result/summary` (its sole
+    required param is `size`), so the old `?page=0&size=1` returns 404 there and
+    breaks first-run init; `size` alone is honored across 26.4.x and returns the
+    newest page (`page` defaults to the first page on releases that have it).
+    Results are newest-first, so the watermark is the max id over whatever comes
+    back (max() keeps it correct even if a release returns them in another order).
+    """
     try:
-        summary = auth.eda_api_get("core/transaction/v2/result/summary?page=0&size=1") or {}
+        summary = auth.eda_api_get("core/transaction/v2/result/summary?size=1") or {}
         results = summary.get("results") or []
-        if results:
-            return int(results[0].get("id", 0))
-        return 0
+        ids = [int(r.get("id", 0)) for r in results if r.get("id") is not None]
+        return max(ids) if ids else 0
     except Exception as e:
-        logger.warning("Failed to discover transaction watermark: %s", e)
+        logger.warning("Failed to discover transaction watermark, starting from 0: %s", e)
         return 0

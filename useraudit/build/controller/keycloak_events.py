@@ -103,6 +103,12 @@ _ALLOWED_LOGIN_EVENTS = {"LOGIN", "LOGOUT"}
 _ALLOWED_ADMIN_RESOURCE_TYPES = {"USER", "GROUP", "CLIENT_ROLE", "USER_FEDERATION", "COMPONENT", "REALM_ROLE", "REALM"}
 _ALLOWED_ADMIN_OPS = {"CREATE", "UPDATE", "DELETE"}
 
+# Keycloak on some EDA releases (e.g. 26.4.1) returns HTTP 500 when the admin-events
+# query carries the `resourceTypes` filter. That param is only a server-side narrowing
+# -- _filter_admin_events() re-applies the same filtering client-side -- so on the first
+# rejection we stop sending it (avoids a 500 every poll) and fetch all resource types.
+_resource_types_filter_ok = [True]
+
 
 def _kc_fetch_login_logout_events(page_size=500) -> List[Dict]:
     params = [("max", page_size)]
@@ -121,16 +127,20 @@ def _kc_fetch_admin_events(page_size=500) -> List[Dict]:
         path = f"/admin/realms/eda/admin-events?{urlencode(params, doseq=True)}"
         return auth.kc_admin_get(path) or []
 
-    try:
+    if _resource_types_filter_ok[0]:
         params = list(base_params)
         for rt in sorted(_ALLOWED_ADMIN_RESOURCE_TYPES):
             params.append(("resourceTypes", rt))
-        return _do(params)
-    except Exception:
         try:
-            return _do(base_params)
-        except Exception:
-            return []
+            return _do(params)
+        except Exception as e:
+            logger.info("Keycloak rejected the admin-events resourceTypes filter (%s); "
+                        "fetching all resource types and filtering client-side from now on", e)
+            _resource_types_filter_ok[0] = False
+    try:
+        return _do(base_params)
+    except Exception:
+        return []
 
 
 # ----------------------------- User/group resolution (from edalogger.py 222-354) ------
