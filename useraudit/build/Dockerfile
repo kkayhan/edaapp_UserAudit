@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-LABEL org.opencontainers.image.source="https://github.com/kkayhan/edaapp_UserAudit"
+LABEL org.opencontainers.image.source="https://github.com/kkayhan/eda-catalog"
 LABEL org.opencontainers.image.description="EDA User Audit Controller"
 LABEL org.opencontainers.image.license="MIT"
 COPY controller/ /app/
