@@ -110,16 +110,67 @@ Returns a JSON object with overall status, last poll time, last transaction ID p
 
 By default the `IPADDR` field in your audit log shows a cluster-internal address (typically `10.244.0.1`) instead of the real laptop / browser IP. **This is not an app bug.** Two normal Kubernetes behaviors erase the source IP before Keycloak sees the request:
 
-1. **kube-proxy SNAT.** Services default to `externalTrafficPolicy: Cluster`, which rewrites the source IP to an internal gateway (`10.244.0.1`) so reply packets find their way back.
-2. **Pod-to-pod forwarding.** `eda-api` re-issues the request internally to Keycloak — the source becomes `eda-api`'s own pod IP.
+1. **kube-proxy SNAT.** The `eda-api` Service defaults to `externalTrafficPolicy: Cluster`, which rewrites the source IP to an internal gateway (`10.244.0.1`) so reply packets find their way back — before `eda-api` ever sees your real IP.
+2. **Pod-to-pod forwarding.** `eda-api` then forwards the request internally to Keycloak. It does carry a client IP across that hop in a forward header (that's what `ProxyMode` controls) — but by then the value is already the SNAT-rewritten `10.244.0.1`, so that is what Keycloak logs.
 
-The real client IP can only survive end-to-end as an HTTP `X-Forwarded-For` header — but **vanilla EDA doesn't ship anything that injects that header.** Nokia is explicit about this in [Exposing the UI/API](https://docs.eda.dev/software-install/exposing-ui-api/):
+For the real IP to survive, two things must hold: **(a)** whatever terminates your external connection must observe your real IP (not a kube-proxy-rewritten one), and **(b)** that IP must reach Keycloak in an HTTP forward header. EDA's `eda-api` already handles **(b)** — its `ProxyMode` setting controls how it writes and trusts `Forwarded` / `X-Forwarded-For` headers (see Nokia's [Platform security → Proxy forward headers](https://docs.eda.dev/user-guide/security/platform-security/#proxy-forward-headers)). The missing piece is **(a)**: by default the `eda-api` Service uses `externalTrafficPolicy: Cluster`, whose SNAT rewrites your source IP to `10.244.0.1` before `eda-api` ever sees it.
+
+How you restore **(a)** depends on your cluster:
+
+- **Single-node or directly-exposed clusters** — the external VIP points straight at `eda-api`, with no reverse proxy in front. One Service setting turns off the SNAT; **no ingress required.** Start here — it's a one-liner and it keeps the audit IP tamper-proof. See [Single-node / directly-exposed clusters](#single-node--directly-exposed-clusters-no-ingress).
+- **Multi-node clusters, or any cluster already behind a reverse proxy** — put an Ingress controller in front of `eda-api` to read the real IP off the socket and inject `X-Forwarded-For`. Nokia ships a kpt package for [Ingress NGINX](https://kubernetes.github.io/ingress-nginx/). See [Kind-based](#kind-based-clusters) / [Talos-based](#talos-based-clusters).
+
+Nokia leaves the ingress piece to the cluster admin — [Exposing the UI/API](https://docs.eda.dev/software-install/exposing-ui-api/):
 
 > "Ingress controllers are not part of Nokia EDA installation, and are typically managed by the cluster administrator."
 
-The fix is for you, the cluster admin, to install an Ingress controller in front of `eda-api`. Nokia ships a kpt package for [Ingress NGINX](https://kubernetes.github.io/ingress-nginx/) — that's what these steps use. The procedure differs slightly between Kind and Talos installs; pick your section.
+---
+
+### Single-node / directly-exposed clusters (no ingress)
+
+If your EDA VIP routes straight to the `eda-api` Service — the common single-node case, with no ingress-nginx and no reverse proxy in front — you don't need any of the ingress machinery below. The only thing corrupting the source IP is the kube-proxy SNAT, and one Service setting disables it.
+
+#### Step 1 — Stop the SNAT on `eda-api`
+
+`externalTrafficPolicy: Local` tells kube-proxy not to rewrite the source IP of traffic arriving at the `eda-api` Service. Since `eda-api` is what terminates your connection, it now sees your real client IP directly.
+
+```bash
+kubectl -n eda-system patch svc eda-api -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+```
+
+**Safe on a single node.** `Local` only risks dropping traffic on a *multi-node* cluster — on nodes that don't happen to run the `eda-api` pod. On a single node there is nowhere else for traffic to go, so reachability is unchanged; only the SNAT stops. Rollback is the same command with `Cluster`.
+
+#### Step 2 — Leave `ProxyMode` at `None` (the default)
+
+You do **not** need to touch `ProxyMode`, and on a directly-exposed cluster you shouldn't. With `ProxyMode: None`, `eda-api` **drops any client-supplied `Forwarded` / `X-Forwarded-*` headers and generates a fresh one from the real TCP peer** — so the logged IP is authoritative and a client cannot spoof it by sending its own header. Confirm it's `None`:
+
+```bash
+kubectl -n eda-system get engineconfig engine-config -o jsonpath='{.spec.cluster.external.proxyMode}{"\n"}'
+# Expect: None
+```
+
+> ⚠️ **Do not set `ProxyMode: XForward` on a directly-exposed cluster.** `XForward` makes `eda-api` *trust* a client-supplied `X-Forwarded-For`, which is correct only when a sanitizing reverse proxy sits in front to overwrite it. Without that proxy, any client can forge the logged IP by sending its own `X-Forwarded-For` header. `XForward` belongs with the ingress recipe below — not this one.
+
+#### Verify
+
+Close **all** EDA browser tabs (or restart the browser), then sign in fresh and pull the log:
+
+```bash
+./pull-audit-logs.sh https://<your-eda-host> . && tail -5 *-$(date +%Y-%m).log
+```
+
+The `IPADDR` on the new `EDA-Login` event should be your real browser IP — not `10.244.0.x`.
+
+> **Why close the tabs first?** `externalTrafficPolicy` changes how *new* connections are handled; connections opened *before* the change keep their old NAT until they close. The EDA UI holds long-lived keep-alive connections, so a tab left open from before the patch keeps logging `10.244.0.1` until it reconnects.
+
+**Two caveats:**
+
+- **Re-apply after an EDA core upgrade.** An upgrade can re-render the `eda-api` Service and reset `externalTrafficPolicy` to `Cluster`. The symptom announces itself — `10.244.0.1` reappears in the log — and the fix is re-running the Step 1 patch.
+- **Internal service logins still show cluster IPs.** `CLIENT_LOGIN` events from EDA's own components (`eda-api-server`, `eda-useraudit`) legitimately originate inside the cluster, so they keep internal addresses. Only interactive user logins carry a real client IP.
 
 ---
+
+**Ingress approach (multi-node, or already behind a reverse proxy).** Use this when `eda-api` is *not* the edge — a real load balancer or reverse proxy terminates client TLS, or you run more than one node so `externalTrafficPolicy: Local` isn't safe. You install an Ingress controller that reads the real client IP off the socket and injects `X-Forwarded-For`, then switch `ProxyMode` to `XForward` so `eda-api` trusts it. The procedure differs slightly between Kind and Talos installs; pick your section below.
 
 ### Kind-based clusters
 
