@@ -36,13 +36,19 @@ There's nothing to configure. The app starts logging the moment it's installed.
 apiVersion: appstore.eda.nokia.com/v1
 kind: Catalog
 metadata:
-  name: community-apps
+  name: kkayhan-catalog
   namespace: eda-system
 spec:
-  remoteURL: https://github.com/kkayhan/edaapp_UserAudit.git
-  skipTLSVerify: false
-  title: Community EDA Apps
+  enabled: true
+  remoteType: git
+  remoteURL: https://github.com/kkayhan/eda-catalog.git
+  refreshInterval: 180
+  title: kkayhan community catalog
 ```
+
+> This is the shared **kkayhan community catalog** — the same one entry also brings the
+> other community apps (Grafana, Image Manager). If you've already added it for another
+> app, skip this step.
 
 **Step 2 — Install from the Store:**
 
