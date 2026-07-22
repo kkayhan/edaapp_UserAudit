@@ -370,14 +370,14 @@ def collect_transaction_lines(tx_id, tx_user, tx_ts_display, tx_iso, user_ip):
 def poll_transactions(last_tx_id, event_window_seconds=3600):
     """
     Poll for new transactions starting from last_tx_id+1.
-    Returns (lines_by_month, last_processed_id, last_tx_iso, tx_count).
+    Returns (lines_by_day, last_processed_id, last_tx_iso, tx_count).
     """
     start_id = (last_tx_id + 1) if last_tx_id is not None else 1
     max_missing = 20
     missing = 0
     last_processed = None
     last_tx_iso = None
-    txn_lines_by_month = {}
+    txn_lines_by_day = {}
     tx_count = 0
 
     tx_id = start_id
@@ -417,8 +417,8 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
         else:
             log_lines = collect_transaction_lines(tx_id, tx_user, tx_ts_display, tx_iso, user_ip)
 
-        month = kc._month_key(tx_iso)
-        txn_lines_by_month.setdefault(month, []).extend((tx_ms, line) for line in log_lines)
+        day = kc._day_key(tx_iso)
+        txn_lines_by_day.setdefault(day, []).extend((tx_ms, line) for line in log_lines)
         last_processed = tx_id
         last_tx_iso = tx_iso
         tx_count += 1
@@ -426,7 +426,7 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
 
     if tx_count:
         logger.info("Processing %d new transactions (IDs %d-%d)", tx_count, start_id, last_processed)
-    return txn_lines_by_month, last_processed, last_tx_iso, tx_count
+    return txn_lines_by_day, last_processed, last_tx_iso, tx_count
 
 
 def discover_current_watermark():

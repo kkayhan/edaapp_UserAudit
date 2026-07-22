@@ -16,7 +16,7 @@ LABEL org.opencontainers.image.license="MIT"
 # shadow:                chpasswd -c SHA512 (busybox chpasswd lacks -c)
 # curl + jq:             Kubernetes API access from entrypoint (secret provisioning)
 RUN apk add --no-cache openssh-server openssh-sftp-server shadow curl jq \
-    && adduser -D -H -h /logs -s /bin/sh -u 1000 audit \
+    && adduser -D -H -h /logs -s /bin/sh -u 1000 readonly \
     && mkdir -p /etc/ssh/keys \
     && chmod 700 /etc/ssh/keys
 
@@ -33,8 +33,8 @@ RUN set -eux; \
     ln -s busybox "$JAIL/bin/sh"; \
     cp /usr/lib/ssh/sftp-server "$JAIL/usr/lib/ssh/"; \
     cp /lib/ld-musl-x86_64.so.1 "$JAIL/lib/"; \
-    printf 'audit:x:1000:1000::/logs:/bin/sh\n' > "$JAIL/etc/passwd"; \
-    printf 'audit:x:1000:\n' > "$JAIL/etc/group"; \
+    printf 'readonly:x:1000:1000::/logs:/bin/sh\n' > "$JAIL/etc/passwd"; \
+    printf 'readonly:x:1000:\n' > "$JAIL/etc/group"; \
     chown root:root "$JAIL"; \
     chmod 755 "$JAIL"
 

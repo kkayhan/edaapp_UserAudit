@@ -6,15 +6,19 @@
 # host identity and the password stay stable across pod restarts. The pod's
 # ServiceAccount (eda-useraudit, wildcard ClusterRole) authorizes the calls.
 #
-# Authentication is PASSWORD-ONLY (user "audit"). The password is stored in
+# Authentication is PASSWORD-ONLY (user "readonly"). The password is stored in
 # the useraudit-sftp Secret and retrievable by the operator with kubectl.
+# It defaults to "readonly"; an operator can change it by editing the Secret's
+# `password` key, and the new value is reused on the next restart.
 #
 # Secret keys:
-#   password              plaintext password for user "audit"
+#   password              plaintext password for user "readonly"
 #   ssh_host_ed25519_key  persistent host private key
 #   ssh_host_rsa_key      persistent host private key (legacy-client compat)
 set -eu
 
+SFTP_USER="readonly"
+DEFAULT_PASSWORD="readonly"
 NS="${POD_NAMESPACE:-eda-system}"
 SECRET_NAME="useraudit-sftp"
 SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
@@ -66,9 +70,9 @@ changed=0
 umask 077
 
 if [ -z "$password" ]; then
-    password=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+    password="$DEFAULT_PASSWORD"
     changed=1
-    log "generated new password"
+    log "seeding default password into the useraudit-sftp Secret"
 fi
 
 if [ -n "$ed_key" ]; then
@@ -116,7 +120,7 @@ if [ "$changed" = "1" ]; then
 fi
 
 # ---- set the account password -------------------------------------------------
-printf 'audit:%s\n' "$password" | chpasswd -c SHA512
+printf '%s:%s\n' "$SFTP_USER" "$password" | chpasswd -c SHA512
 unset password
 rm -f "$TMP"
 
@@ -130,5 +134,5 @@ rm -f "$TMP"
 # Observed on Talos; Docker's default 1024 masked it.
 ulimit -n 1024 2>/dev/null || true
 
-log "starting sshd (user: audit, password-only, chroot: $JAIL, read-only via external sftp-server)"
+log "starting sshd (user: $SFTP_USER, password-only, chroot: $JAIL, read-only via external sftp-server)"
 exec /usr/sbin/sshd -D -e

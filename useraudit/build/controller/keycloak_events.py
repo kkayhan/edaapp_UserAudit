@@ -64,11 +64,12 @@ def _iso_from_epoch_ms(ms: int) -> str:
         return "unknown-time"
 
 
-def _month_key(ts: str) -> str:
+def _day_key(ts: str) -> str:
+    """Log-file grouping key: one file per DAY (EDA-user-events-YYYY-MM-DD.log)."""
     dt = _parse_iso_datetime(ts)
     if not dt:
-        return "unknown-month"
-    return dt.strftime("%Y-%m")
+        return "unknown-date"
+    return dt.strftime("%Y-%m-%d")
 
 
 # ----------------------------- KC Event auto-enablement (NEW) -------------------------
@@ -421,7 +422,7 @@ def collect_keycloak_user_logs(last_event_ms: int,
                                user_id_map: Optional[Dict[str, str]],
                                group_id_map: Optional[Dict[str, str]]) -> Tuple[int, int, Dict[str, List[Tuple[int, str]]], Dict[str, str], Dict[str, str]]:
     """
-    Fetch KC user/admin events; returns (count, max_seen_ms, lines_by_month, updated_user_map, updated_group_map).
+    Fetch KC user/admin events; returns (count, max_seen_ms, lines_by_day, updated_user_map, updated_group_map).
     """
     user_cache: Dict[str, Optional[str]] = {}
     base_user_map = dict(user_id_map or {})
@@ -451,15 +452,15 @@ def collect_keycloak_user_logs(last_event_ms: int,
         if gid and gname:
             group_target_cache.setdefault(gid, gname)
 
-    new_lines_by_month: Dict[str, List[Tuple[int, str]]] = {}
+    new_lines_by_day: Dict[str, List[Tuple[int, str]]] = {}
     max_seen_ms = last_event_ms
 
     def _add_line(ts_ms, iso_ts, line):
         nonlocal max_seen_ms
         if ts_ms <= last_event_ms:
             return
-        month = _month_key(iso_ts)
-        new_lines_by_month.setdefault(month, []).append((ts_ms, line))
+        day = _day_key(iso_ts)
+        new_lines_by_day.setdefault(day, []).append((ts_ms, line))
         max_seen_ms = max(max_seen_ms, ts_ms)
 
     for ev in login_events:
@@ -478,7 +479,7 @@ def collect_keycloak_user_logs(last_event_ms: int,
         if formatted:
             _add_line(*formatted)
 
-    total = sum(len(v) for v in new_lines_by_month.values())
+    total = sum(len(v) for v in new_lines_by_day.values())
 
     for ev in admin_events:
         if (ev.get("resourceType") or "").upper() == "USER" and (ev.get("operationType") or "").upper() == "DELETE":
@@ -493,4 +494,4 @@ def collect_keycloak_user_logs(last_event_ms: int,
     updated_user_map = {k: v for k, v in user_target_cache.items() if v}
     updated_group_map = {k: v for k, v in group_target_cache.items() if v}
     logger.info("Fetched %d login events, %d admin events", len(login_events), len(admin_events))
-    return total, max_seen_ms, new_lines_by_month, updated_user_map, updated_group_map
+    return total, max_seen_ms, new_lines_by_day, updated_user_map, updated_group_map

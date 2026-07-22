@@ -6,7 +6,7 @@ A Nokia **EDA** app that turns the EDA cluster into a system-of-record for **who
 - every **sign-in and sign-out** to the EDA GUI
 - every **administrative change** in Keycloak (user / group / role management)
 
-All events are written to monthly log files (`Transaction-YYYY-MM.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint and a read-only SFTP endpoint (port 22522 by default, user `audit`, password or SSH-key auth) — no scraping, no parsing, no extra tooling.
+All events are written to daily log files (`EDA-user-events-YYYY-MM-DD.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint and a read-only SFTP endpoint (port 22522 by default, user `readonly`, password auth) — no scraping, no parsing, no extra tooling.
 
 A typical line looks like this:
 
@@ -76,27 +76,28 @@ curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
 
 ```json
 [
-  {"name": "Transaction-2026-04.log", "size_bytes": 18432, "modified": "2026-04-30T23:59:00Z"},
-  {"name": "Transaction-2026-05.log", "size_bytes":  4221, "modified": "2026-05-04T08:14:12Z"}
+  {"name": "EDA-user-events-2026-05-03.log", "size_bytes": 18432, "modified": "2026-05-03T23:59:00Z"},
+  {"name": "EDA-user-events-2026-05-04.log", "size_bytes":  4221, "modified": "2026-05-04T08:14:12Z"}
 ]
 ```
 
 **Step 2 — download a specific file.** Append the `name` from the listing to the URL:
 
 ```bash
-curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/Transaction-2026-05.log
+curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/EDA-user-events-2026-05-04.log
 ```
 
 ### SFTP endpoint
 
-The same logs are also served over **read-only SFTP** for collectors that speak SFTP natively (SIEM pullers, compliance archivers, plain `sftp`/WinSCP/FileZilla). SFTP runs over SSH, so it uses its own port (default **22522**, an install-time setting) rather than the EDA HttpProxy. The login user is `audit`, password-authenticated; the session is chroot-jailed to the log directory with no shell and no write access.
+The same logs are also served over **read-only SFTP** for collectors that speak SFTP natively (SIEM pullers, compliance archivers, plain `sftp`/WinSCP/FileZilla). SFTP runs over SSH, so it uses its own port (default **22522**, an install-time setting) rather than the EDA HttpProxy. The login user is `readonly` (default password `readonly`), password-authenticated; the session is chroot-jailed to the log directory with no shell and no write access.
 
 ```bash
-# Password (auto-generated at install, stored in the useraudit-sftp Secret):
+# Confirm / change the password (stored in the useraudit-sftp Secret, defaults to "readonly"):
 kubectl -n eda-system get secret useraudit-sftp -o jsonpath='{.data.password}' | base64 -d
 
-# Connect (the live address is in the CRD status field `sftpEndpoint`):
-sftp -P 22522 audit@<eda-vip>
+# Connect (live address is in CRD status.sftpEndpoint). The two -o options keep your
+# SSH client from saving the host key, so a later app reinstall won't need a known_hosts cleanup:
+sftp -P 22522 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null readonly@<eda-vip>
 ```
 
 ### Helper script
@@ -111,7 +112,7 @@ sftp -P 22522 audit@<eda-vip>
 ./pull-audit-logs.sh https://<your-eda-host> ./audit-archive
 
 # Download a single named file
-./pull-audit-logs.sh https://<your-eda-host> ./audit-archive Transaction-2026-05.log
+./pull-audit-logs.sh https://<your-eda-host> ./audit-archive EDA-user-events-2026-05-04.log
 ```
 
 ### Health check

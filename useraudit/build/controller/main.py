@@ -14,7 +14,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "v26.4.1-6"
+VERSION = "v26.4.1-7"
 DATA_DIR = "/data/logs"
 NAMESPACE = os.environ.get("POD_NAMESPACE", "eda-system")
 CRD_GROUP = "useraudit.eda.edacommunity.com"
@@ -92,12 +92,12 @@ def _sftp_endpoint():
         if svc_type == "LoadBalancer":
             ingress = (((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or [])
             if ingress and ingress[0].get("ip"):
-                return f"audit@{ingress[0]['ip']} port {port}"
+                return f"readonly@{ingress[0]['ip']} port {port}"
             return f"pending external IP (port {port})"
         if svc_type == "NodePort":
             node_port = ports[0].get("nodePort", "")
-            return f"audit@<node-ip> port {node_port}"
-        return f"audit@{SFTP_SERVICE}.{NAMESPACE}.svc port {port} (cluster-internal)"
+            return f"readonly@<node-ip> port {node_port}"
+        return f"readonly@{SFTP_SERVICE}.{NAMESPACE}.svc port {port} (cluster-internal)"
     except Exception as e:
         logger.warning("SFTP endpoint lookup failed: %s", e)
         return ""
@@ -209,8 +209,15 @@ def _update_crd_status(health, message, last_poll_time, last_tx_id, last_event_m
 # ----------------------------- Cleanup thread ---------------------------------------
 
 def _cleanup_run(retention_months):
-    """Run cleanup: time-based retention then space-based."""
+    """Run cleanup: time-based retention then space-based.
+
+    Log files are one per DAY (EDA-user-events-YYYY-MM-DD.log). Retention is
+    still expressed in months; a file's age is computed from its year+month.
+    Legacy monthly files (EDA-user-events-YYYY-MM.log, pre-daily versions) are
+    parsed by the same [:4]/[5:7] slicing and age out identically.
+    """
     now = datetime.now(timezone.utc)
+    current_day = now.strftime("%Y-%m-%d")
     current_month = now.strftime("%Y-%m")
     deleted = 0
 
@@ -219,11 +226,11 @@ def _cleanup_run(retention_months):
         for name in sorted(os.listdir(DATA_DIR)):
             if not name.startswith("EDA-user-events-") or not name.endswith(".log"):
                 continue
-            file_month = name.replace("EDA-user-events-", "").replace(".log", "")
-            if file_month == current_month:
+            file_date = name.replace("EDA-user-events-", "").replace(".log", "")
+            if file_date in (current_day, current_month):
                 continue
             try:
-                file_year, file_mo = int(file_month[:4]), int(file_month[5:7])
+                file_year, file_mo = int(file_date[:4]), int(file_date[5:7])
                 now_year, now_mo = now.year, now.month
                 age_months = (now_year - file_year) * 12 + (now_mo - file_mo)
                 if age_months > retention_months:
@@ -242,7 +249,7 @@ def _cleanup_run(retention_months):
         if pct > 90:
             log_files = sorted(
                 [f for f in os.listdir(DATA_DIR) if f.startswith("EDA-user-events-") and f.endswith(".log")
-                 and f.replace("EDA-user-events-", "").replace(".log", "") != current_month]
+                 and f.replace("EDA-user-events-", "").replace(".log", "") not in (current_day, current_month)]
             )
             for name in log_files:
                 if pct <= 90:
@@ -258,7 +265,7 @@ def _cleanup_run(retention_months):
             if pct > 90:
                 with _cleanup_lock:
                     _cleanup_health[0] = "degraded"
-                    _cleanup_message[0] = "Log storage above 90% — only current month's log remains, cannot free more space"
+                    _cleanup_message[0] = "Log storage above 90% — only today's log remains, cannot free more space"
                 logging.getLogger("cleanup").warning("Disk usage still above 90%% after cleanup")
             else:
                 with _cleanup_lock:
@@ -437,12 +444,12 @@ def main():
             logger.warning("KC event enablement failed: %s", e)
 
         # Poll transactions
-        txn_lines_by_month = {}
+        txn_lines_by_day = {}
         last_processed = None
         last_tx_iso = None
         tx_count = 0
         try:
-            txn_lines_by_month, last_processed, last_tx_iso, tx_count = txn.poll_transactions(last_tx_id)
+            txn_lines_by_day, last_processed, last_tx_iso, tx_count = txn.poll_transactions(last_tx_id)
             total_txns += tx_count
         except Exception as e:
             logger.error("Transaction polling failed: %s\n%s", e, traceback.format_exc())
@@ -451,10 +458,10 @@ def main():
 
         # Poll KC events
         kc_count = 0
-        kc_lines_by_month = {}
+        kc_lines_by_day = {}
         new_event_ms = last_event_ms
         try:
-            kc_count, new_event_ms, kc_lines_by_month, user_map, group_map = kc.collect_keycloak_user_logs(
+            kc_count, new_event_ms, kc_lines_by_day, user_map, group_map = kc.collect_keycloak_user_logs(
                 last_event_ms, user_map, group_map
             )
             total_kc_events += kc_count
@@ -462,17 +469,17 @@ def main():
             logger.warning("KC event collection failed: %s", e)
             kc_health = "error"
 
-        # Write log lines
-        months = sorted(set(list(txn_lines_by_month.keys()) + list(kc_lines_by_month.keys())))
+        # Write log lines (one file per day)
+        days = sorted(set(list(txn_lines_by_day.keys()) + list(kc_lines_by_day.keys())))
         total_lines = 0
-        for month in months:
+        for day in days:
             combined = []
-            combined.extend(txn_lines_by_month.get(month, []))
-            combined.extend(kc_lines_by_month.get(month, []))
+            combined.extend(txn_lines_by_day.get(day, []))
+            combined.extend(kc_lines_by_day.get(day, []))
             if not combined:
                 continue
             combined.sort(key=lambda x: (x[0], x[1]))
-            out = Path(DATA_DIR) / f"EDA-user-events-{month}.log"
+            out = Path(DATA_DIR) / f"EDA-user-events-{day}.log"
             with out.open("a", encoding="utf-8") as fh:
                 for _, line in combined:
                     fh.write(line + "\n")

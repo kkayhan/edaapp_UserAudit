@@ -1,5 +1,5 @@
 # EDA User Audit — read-only SFTP endpoint.
-# Serves /data/logs (mounted read-only at /srv/sftp/logs) to user "audit".
+# Serves /data/logs (mounted read-only at /srv/sftp/logs) to user "readonly".
 # No shell, no forwarding, chroot jail, SFTP subsystem forced read-only.
 
 Port 22
@@ -10,7 +10,7 @@ HostKey /etc/ssh/keys/ssh_host_ed25519_key
 HostKey /etc/ssh/keys/ssh_host_rsa_key
 
 PermitRootLogin no
-AllowUsers audit
+AllowUsers readonly
 MaxAuthTries 4
 LoginGraceTime 30
 

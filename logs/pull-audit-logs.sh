@@ -5,7 +5,7 @@
 # Usage:
 #   ./pull-audit-logs.sh https://my-eda-host
 #   ./pull-audit-logs.sh https://my-eda-host ./output-dir
-#   ./pull-audit-logs.sh https://my-eda-host ./output-dir Transaction-2026-04.log
+#   ./pull-audit-logs.sh https://my-eda-host ./output-dir EDA-user-events-2026-05-04.log
 #
 # Requires: bash, curl. No other dependencies.
 #
