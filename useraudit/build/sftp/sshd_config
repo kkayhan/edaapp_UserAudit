@@ -1,0 +1,49 @@
+# EDA User Audit — read-only SFTP endpoint.
+# Serves /data/logs (mounted read-only at /srv/sftp/logs) to user "audit".
+# No shell, no forwarding, chroot jail, SFTP subsystem forced read-only.
+
+Port 22
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+HostKey /etc/ssh/keys/ssh_host_rsa_key
+
+PermitRootLogin no
+AllowUsers audit
+MaxAuthTries 4
+LoginGraceTime 30
+
+# OpenSSH >=9.8 penalizes source IPs that connect without authenticating.
+# Inside the cluster ALL traffic (kubelet probes AND real clients) arrives
+# SNAT'd from the node's CNI gateway IP, so penalties collectively punish
+# legitimate clients for probe traffic. Disable them; MaxAuthTries still
+# bounds per-connection guessing.
+PerSourcePenalties no
+
+# Password-only authentication.
+PasswordAuthentication yes
+PermitEmptyPasswords no
+PubkeyAuthentication no
+KbdInteractiveAuthentication no
+
+# Kubernetes Secret / device-node mounts are root-owned; StrictModes
+# heuristics false-positive on them. All relevant paths are root-controlled.
+StrictModes no
+
+# SFTP only, read-only, jailed. We use the external sftp-server binary (baked
+# into the jail by the Dockerfile) rather than internal-sftp, which hangs in a
+# chroot on some runtimes (e.g. Talos). ForceCommand locks EVERY session to the
+# read-only SFTP server, so even a bare `ssh` gets no shell. -R = read-only.
+Subsystem sftp /usr/lib/ssh/sftp-server -R
+ChrootDirectory /srv/sftp
+ForceCommand /usr/lib/ssh/sftp-server -R
+
+AllowTcpForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTTY no
+PermitTunnel no
+GatewayPorts no
+PrintMotd no
+LogLevel INFO

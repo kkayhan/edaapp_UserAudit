@@ -6,6 +6,25 @@ Versions follow the EDA release the app is built and validated against, with
 an incrementing build suffix: `v<eda-release>-<n>` (e.g. `v26.4.3-1`,
 `v26.4.3-2`). When the target EDA release changes, the suffix restarts at `-1`.
 
+## v26.4.1-6
+
+- New: read-only SFTP endpoint for audit log collection, alongside the existing
+  HTTP API. An OpenSSH sidecar (`useraudit-sftp` image) joins the controller pod,
+  serving the log volume read-only to user `audit` — chroot-jailed, no shell,
+  uploads/deletes refused at three layers (read-only mount, `internal-sftp -R`,
+  chroot). Exposed on port 22522 by default via a `LoadBalancer` Service that
+  joins EDA's shared MetalLB VIP (`metallb.universe.tf/allow-shared-ip`);
+  service type and port are configurable at install time (new app settings
+  `sftpPort`, `sftpServiceType`).
+- Credentials: password authentication. The password is auto-generated on first
+  start and persisted in the `useraudit-sftp` Secret together with the SSH host
+  keys (stable host identity across restarts). Retrieve it with
+  `kubectl -n eda-system get secret useraudit-sftp -o jsonpath='{.data.password}' | base64 -d`.
+- CRD status now reports the live endpoint in `status.sftpEndpoint`.
+- The sidecar populates its chroot jail with the `/dev` nodes and account files
+  `internal-sftp` requires after chroot, so SFTP starts correctly on runtimes
+  (e.g. Talos) whose containers don't pre-populate a usable `/dev`.
+
 ## v26.4.1-5
 
 - Robustness hardening of the v26.4.1-4 stored-secret path (no new features). Four

@@ -6,7 +6,7 @@ A Nokia **EDA** app that turns the EDA cluster into a system-of-record for **who
 - every **sign-in and sign-out** to the EDA GUI
 - every **administrative change** in Keycloak (user / group / role management)
 
-All events are written to monthly log files (`Transaction-YYYY-MM.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint — no scraping, no parsing, no extra tooling.
+All events are written to monthly log files (`Transaction-YYYY-MM.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint and a read-only SFTP endpoint (port 22522 by default, user `audit`, password or SSH-key auth) — no scraping, no parsing, no extra tooling.
 
 A typical line looks like this:
 
@@ -85,6 +85,18 @@ curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
 
 ```bash
 curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/Transaction-2026-05.log
+```
+
+### SFTP endpoint
+
+The same logs are also served over **read-only SFTP** for collectors that speak SFTP natively (SIEM pullers, compliance archivers, plain `sftp`/WinSCP/FileZilla). SFTP runs over SSH, so it uses its own port (default **22522**, an install-time setting) rather than the EDA HttpProxy. The login user is `audit`, password-authenticated; the session is chroot-jailed to the log directory with no shell and no write access.
+
+```bash
+# Password (auto-generated at install, stored in the useraudit-sftp Secret):
+kubectl -n eda-system get secret useraudit-sftp -o jsonpath='{.data.password}' | base64 -d
+
+# Connect (the live address is in the CRD status field `sftpEndpoint`):
+sftp -P 22522 audit@<eda-vip>
 ```
 
 ### Helper script

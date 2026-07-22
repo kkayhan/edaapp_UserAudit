@@ -17,6 +17,7 @@ Y_TRANSACTIONSPROCESSED = 'transactionsProcessed'
 Y_KCEVENTSPROCESSED = 'kcEventsProcessed'
 Y_LOGFILES = 'logFiles'
 Y_SUBSYSTEMS = 'subsystems'
+Y_SFTPENDPOINT = 'sftpEndpoint'
 Y_VERSION = 'version'
 Y_SIZEBYTES = 'sizeBytes'
 Y_EDAAPI = 'edaApi'
@@ -124,6 +125,7 @@ class UserAuditConfigStatus:
         kcEventsProcessed: int | None = None,
         logFiles: list[LogFileInfo] | None = None,
         subsystems: SubsystemHealth | None = None,
+        sftpEndpoint: str | None = None,
         version: str | None = None,
     ):
         self.health = health
@@ -135,6 +137,7 @@ class UserAuditConfigStatus:
         self.kcEventsProcessed = kcEventsProcessed
         self.logFiles = logFiles
         self.subsystems = subsystems
+        self.sftpEndpoint = sftpEndpoint
         self.version = version
 
     def to_input(self):  # pragma: no cover
@@ -157,6 +160,8 @@ class UserAuditConfigStatus:
             _rval[Y_LOGFILES] = [x.to_input() for x in self.logFiles]
         if self.subsystems is not None:
             _rval[Y_SUBSYSTEMS] = self.subsystems.to_input()
+        if self.sftpEndpoint is not None:
+            _rval[Y_SFTPENDPOINT] = self.sftpEndpoint
         if self.version is not None:
             _rval[Y_VERSION] = self.version
         return _rval
@@ -176,6 +181,7 @@ class UserAuditConfigStatus:
                 for x in obj.get(Y_LOGFILES):
                     _logFiles.append(LogFileInfo.from_input(x))
             _subsystems = SubsystemHealth.from_input(obj.get(Y_SUBSYSTEMS))
+            _sftpEndpoint = obj.get(Y_SFTPENDPOINT)
             _version = obj.get(Y_VERSION)
             return UserAuditConfigStatus(
                 health=_health,
@@ -187,6 +193,7 @@ class UserAuditConfigStatus:
                 kcEventsProcessed=_kcEventsProcessed,
                 logFiles=_logFiles,
                 subsystems=_subsystems,
+                sftpEndpoint=_sftpEndpoint,
                 version=_version,
             )
         return None  # pragma: no cover

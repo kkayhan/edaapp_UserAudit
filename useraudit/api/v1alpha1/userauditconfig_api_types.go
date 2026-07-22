@@ -59,6 +59,10 @@ type UserAuditConfigStatus struct {
 	// Subsystems reports the health of each data source.
 	Subsystems SubsystemHealth `json:"subsystems,omitempty"`
 
+	// SftpEndpoint is where the read-only SFTP service is reachable
+	// (user "audit"), e.g. "audit@100.124.177.212 port 22522".
+	SftpEndpoint string `json:"sftpEndpoint,omitempty"`
+
 	// Version is the controller version string.
 	Version string `json:"version,omitempty"`
 }
