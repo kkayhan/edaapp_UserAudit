@@ -95,6 +95,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self.send_error(500, "Internal Server Error")
 
     def _serve_log_file(self, filename):
+        # Only .log files are served (hides dotfiles like .healthz.json)
+        if not filename.endswith(".log") or filename.startswith("."):
+            self.send_error(404, "Not Found")
+            return
         # Path traversal protection
         if ".." in filename or "/" in filename or "\\" in filename:
             self.send_error(403, "Forbidden")
@@ -121,12 +125,18 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
 
 def write_healthz(status="ok", last_poll=None):
-    """Atomic write of .healthz.json via rename."""
-    data = json.dumps({"status": status, "last_poll": last_poll})
-    tmp = HEALTHZ_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(data)
-    os.replace(tmp, HEALTHZ_FILE)
+    """Atomic write of .healthz.json via rename. Never raises: on a full/broken
+    PVC the /healthz handler serves the previous (or fallback) content — a pod
+    restart cannot fix a disk problem, and the poll loop already surfaces write
+    failures in the CRD status."""
+    try:
+        data = json.dumps({"status": status, "last_poll": last_poll})
+        tmp = HEALTHZ_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, HEALTHZ_FILE)
+    except OSError as e:
+        logger.error("Cannot write healthz file: %s", e)
 
 
 def start_file_server(port=8080):

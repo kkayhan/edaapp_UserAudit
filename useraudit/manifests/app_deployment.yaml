@@ -25,7 +25,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: useraudit-controller
-          image: ghcr.io/kkayhan/eda-catalog/useraudit-controller:v26.4.1-7
+          image: ghcr.io/kkayhan/eda-catalog/useraudit-controller:v26.4.1-8
           imagePullPolicy: IfNotPresent
           env:
             - name: POD_NAMESPACE
@@ -64,7 +64,7 @@ spec:
               cpu: "50m"
               memory: "64Mi"
         - name: useraudit-sftp
-          image: ghcr.io/kkayhan/eda-catalog/useraudit-sftp:v26.4.1-7
+          image: ghcr.io/kkayhan/eda-catalog/useraudit-sftp:v26.4.1-8
           imagePullPolicy: IfNotPresent
           env:
             - name: POD_NAMESPACE

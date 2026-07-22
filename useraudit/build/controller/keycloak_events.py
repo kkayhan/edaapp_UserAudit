@@ -5,6 +5,7 @@ Ported from edalogger.py lines 175-665 with adaptations for controller mode.
 
 import json
 import logging
+import urllib.error
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode, quote
@@ -16,12 +17,21 @@ logger = logging.getLogger("kc")
 # ----------------------------- Timestamp utilities (from edalogger.py 177-220) --------
 
 def _parse_iso_datetime(ts: str) -> Optional[datetime]:
+    """Parse an ISO 8601 timestamp; returns None for empty OR UNPARSEABLE input.
+    Must never raise: a single transaction whose lastChangeTimestamp we can't
+    parse would otherwise fail the poll cycle BEFORE the watermark advances past
+    it — the same transaction is then re-hit every cycle, permanently stalling
+    transaction auditing (poison pill). Callers fall back to now()/skip."""
     ts = (ts or "").strip()
     if not ts:
         return None
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
-    dt = datetime.fromisoformat(ts)
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        logger.warning("Unparseable timestamp %r — treating as absent", ts)
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
@@ -120,6 +130,11 @@ def _kc_fetch_login_logout_events(page_size=500) -> List[Dict]:
 
 
 def _kc_fetch_admin_events(page_size=500) -> List[Dict]:
+    """Fetch admin events. Raises on fetch failure — the caller propagates it so
+    kc_health reflects a Keycloak outage (a silent [] here reported 'ok' while
+    blind). Only the documented 26.4.1 quirk — HTTP 500 on the resourceTypes
+    filter — is handled, by retrying without the filter and not sending it again
+    (filtering is re-applied client-side by _filter_admin_events)."""
     base_params = [("max", page_size)]
     for op in sorted(_ALLOWED_ADMIN_OPS):
         base_params.append(("operationTypes", op))
@@ -134,14 +149,13 @@ def _kc_fetch_admin_events(page_size=500) -> List[Dict]:
             params.append(("resourceTypes", rt))
         try:
             return _do(params)
-        except Exception as e:
-            logger.info("Keycloak rejected the admin-events resourceTypes filter (%s); "
-                        "fetching all resource types and filtering client-side from now on", e)
+        except urllib.error.HTTPError as e:
+            if e.code != 500:
+                raise
+            logger.info("Keycloak rejected the admin-events resourceTypes filter (HTTP 500); "
+                        "fetching all resource types and filtering client-side from now on")
             _resource_types_filter_ok[0] = False
-    try:
-        return _do(base_params)
-    except Exception:
-        return []
+    return _do(base_params)
 
 
 # ----------------------------- User/group resolution (from edalogger.py 222-354) ------
@@ -406,8 +420,12 @@ def _format_admin_event_line(ev: Dict, user_lookup=None,
         line = (f"{display_ts} | Event=USERGROUP-{op} | User={actor} | IPADDR={ip} | "
                 f"UserGroup {target_label} has been {action_word}.")
     elif rt == "REALM":
+        # Generic wording: a REALM update is ANY realm-settings change (password
+        # policy, event config, themes, ...). The old fixed text "Password policy
+        # has been modified" produced false audit lines — notably for this app's
+        # own event-enablement PUT on first install.
         line = (f"{display_ts} | Event=REALM-{op} | User={actor} | IPADDR={ip} | "
-                f"Password policy has been modified.")
+                f"Realm settings have been modified.")
     else:
         descriptor = f"LDAP-{op}" if rt in {"USER_FEDERATION", "COMPONENT"} else f"{rt}-{op}"
         line = (f"{display_ts} | Event=Keycloak-{descriptor} | User={actor} | IPADDR={ip} | "
@@ -430,18 +448,13 @@ def collect_keycloak_user_logs(last_event_ms: int,
     user_target_cache: Dict[str, Optional[str]] = dict(base_user_map)
     group_target_cache: Dict[str, Optional[str]] = dict(base_group_map)
 
-    login_events = []
-    admin_events_raw = []
-
-    try:
-        login_events = _kc_fetch_login_logout_events()
-    except Exception as e:
-        logger.warning("KC login/logout events fetch failed: %s", e)
-
-    try:
-        admin_events_raw = _kc_fetch_admin_events()
-    except Exception as e:
-        logger.warning("KC admin events fetch failed: %s", e)
+    # Fetch failures PROPAGATE (no silent empty-list fallback): the caller marks
+    # kc_health=error so a Keycloak outage is visible in the CRD status instead
+    # of reporting "All systems operational" while blind. The event watermark is
+    # untouched on raise, so the next cycle re-fetches — nothing is lost (within
+    # the documented 500-event cap).
+    login_events = _kc_fetch_login_logout_events()
+    admin_events_raw = _kc_fetch_admin_events()
 
     admin_events = _filter_admin_events(admin_events_raw)
     for ev in admin_events:

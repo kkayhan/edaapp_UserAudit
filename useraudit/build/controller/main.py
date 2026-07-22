@@ -11,10 +11,10 @@ import shutil
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "v26.4.1-7"
+VERSION = "v26.4.1-8"
 DATA_DIR = "/data/logs"
 NAMESPACE = os.environ.get("POD_NAMESPACE", "eda-system")
 CRD_GROUP = "useraudit.eda.edacommunity.com"
@@ -33,6 +33,12 @@ logger = logging.getLogger("main")
 _cleanup_lock = threading.Lock()
 _cleanup_health = [None]  # None, "degraded", or "error"
 _cleanup_message = [""]
+
+# Serializes read-modify-write of the state ConfigMap between the poll loop and
+# the cleanup thread. Without it, concurrent writes race: the loser gets a 409
+# (watermarks not persisted that cycle -> duplicate audit lines next cycle) or
+# silently reverts the other thread's lastCleanupTime.
+_state_lock = threading.Lock()
 
 shutdown_event = threading.Event()
 
@@ -104,28 +110,43 @@ def _sftp_endpoint():
 
 
 def _ensure_default_cr():
-    """Create default UserAuditConfig CR if none exists."""
+    """Create default UserAuditConfig CR if none exists. Fully guarded — a transient
+    K8s API error must not crash the process; called once per poll cycle, so an
+    absent CR (or a failed create) self-heals on the next cycle."""
     import k8s
-    cr = k8s.read_cr(CRD_GROUP, CRD_VERSION, CRD_PLURAL, CRD_NAME)
-    if cr:
-        return
-    body = {
-        "apiVersion": f"{CRD_GROUP}/{CRD_VERSION}",
-        "kind": "UserAuditConfig",
-        "metadata": {"name": CRD_NAME},
-        "spec": {},
-    }
     try:
+        cr = k8s.read_cr(CRD_GROUP, CRD_VERSION, CRD_PLURAL, CRD_NAME)
+        if cr:
+            return
+        body = {
+            "apiVersion": f"{CRD_GROUP}/{CRD_VERSION}",
+            "kind": "UserAuditConfig",
+            "metadata": {"name": CRD_NAME},
+            "spec": {},
+        }
         k8s.create_cr(CRD_GROUP, CRD_VERSION, CRD_PLURAL, body)
         logger.info("Created default UserAuditConfig CR")
     except Exception as e:
-        logger.warning("Failed to create default UserAuditConfig: %s", e)
+        logger.warning("Failed to ensure default UserAuditConfig: %s", e)
 
 
 # ----------------------------- State (ConfigMap) ------------------------------------
 
+def _safe_json_obj(raw):
+    """Parse a JSON object from ConfigMap data; corrupt/non-dict input degrades to {}.
+    The users/groups keys are only caches — losing them costs a few KC lookups,
+    while raising here would wedge every poll cycle until someone fixes the CM."""
+    try:
+        v = json.loads(raw or "{}")
+        return v if isinstance(v, dict) else {}
+    except ValueError:
+        return {}
+
+
 def _read_state():
-    """Read watermarks from ConfigMap. Returns (state_dict, resource_version)."""
+    """Read watermarks from ConfigMap. Returns (state_dict, resource_version).
+    Corrupt WATERMARK values still raise (defaulting them to 0 would replay the
+    entire transaction history); the caller logs and retries next cycle."""
     import k8s
     cm = k8s.read_configmap(CM_NAME, NAMESPACE)
     if not cm:
@@ -136,8 +157,8 @@ def _read_state():
         "lastTransactionID": int(data.get("lastTransactionID", "0") or "0"),
         "lastCommitTimestamp": data.get("lastCommitTimestamp", ""),
         "lastUserEventMs": int(data.get("lastUserEventMs", "0") or "0"),
-        "users": json.loads(data.get("users", "{}")),
-        "groups": json.loads(data.get("groups", "{}")),
+        "users": _safe_json_obj(data.get("users")),
+        "groups": _safe_json_obj(data.get("groups")),
         "lastCleanupTime": data.get("lastCleanupTime", ""),
     }
     return state, rv
@@ -169,9 +190,14 @@ def _write_state(state, resource_version=None):
 
 def _update_crd_status(health, message, last_poll_time, last_tx_id, last_event_ms,
                        txns_processed, kc_events_processed, subsystems, sftp_endpoint=""):
-    """Update UserAuditConfig CRD status subresource."""
+    """Update UserAuditConfig CRD status subresource. Fully guarded — status
+    reporting must never take down the poll loop."""
     import k8s
-    cr = k8s.read_cr(CRD_GROUP, CRD_VERSION, CRD_PLURAL, CRD_NAME)
+    try:
+        cr = k8s.read_cr(CRD_GROUP, CRD_VERSION, CRD_PLURAL, CRD_NAME)
+    except Exception as e:
+        logger.warning("Failed to read CR for status update: %s", e)
+        return
     if not cr:
         return
 
@@ -285,11 +311,19 @@ def _cleanup_run(retention_months):
 
 
 def _cleanup_thread(get_retention):
-    """Background cleanup thread: startup check + daily 3 AM."""
+    """Background cleanup thread: startup check + daily 3 AM.
+
+    Every step is guarded: this thread is the only thing standing between the
+    PVC and 100% disk, and an uncaught exception here dies silently (daemon
+    thread) — cleanup would simply never run again until the pod restarts."""
     cleanup_logger = logging.getLogger("cleanup")
 
-    # Read lastCleanupTime from state
-    state, _ = _read_state()
+    # Read lastCleanupTime from state (transient K8s error -> treat as unknown, run now)
+    state = None
+    try:
+        state, _ = _read_state()
+    except Exception as e:
+        cleanup_logger.warning("Could not read state at startup: %s", e)
     last_cleanup_str = (state or {}).get("lastCleanupTime", "")
     now = datetime.now(timezone.utc)
     run_now = True
@@ -305,31 +339,41 @@ def _cleanup_thread(get_retention):
 
     if run_now:
         cleanup_logger.info("Running startup cleanup")
-        retention = get_retention()
-        _cleanup_run(retention)
-        _update_cleanup_time()
+        try:
+            _cleanup_run(get_retention())
+            _update_cleanup_time()
+        except Exception as e:
+            cleanup_logger.error("Startup cleanup failed: %s", e)
 
     # Schedule daily at 3 AM
     while not shutdown_event.is_set():
         now = datetime.now()
         next_3am = now.replace(hour=3, minute=0, second=0, microsecond=0)
         if now >= next_3am:
-            next_3am = next_3am.replace(day=next_3am.day + 1)
+            # timedelta, NOT replace(day=day+1): the latter raises ValueError on the
+            # last day of a month ("day is out of range"), permanently killing this
+            # thread the first month-end it crosses.
+            next_3am += timedelta(days=1)
         wait_secs = (next_3am - now).total_seconds()
         if shutdown_event.wait(timeout=wait_secs):
             break  # shutdown
         cleanup_logger.info("Daily cleanup started (retention: %d months)", get_retention())
-        _cleanup_run(get_retention())
-        _update_cleanup_time()
+        try:
+            _cleanup_run(get_retention())
+            _update_cleanup_time()
+        except Exception as e:
+            cleanup_logger.error("Daily cleanup failed: %s", e)
 
 
 def _update_cleanup_time():
-    """Update lastCleanupTime in ConfigMap."""
+    """Update lastCleanupTime in ConfigMap (re-reads fresh state under the lock
+    so watermarks written by the poll loop are never rolled back)."""
     try:
-        state, rv = _read_state()
-        if state and rv:
-            state["lastCleanupTime"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            _write_state(state, rv)
+        with _state_lock:
+            state, rv = _read_state()
+            if state and rv:
+                state["lastCleanupTime"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                _write_state(state, rv)
     except Exception as e:
         logging.getLogger("cleanup").warning("Failed to update lastCleanupTime: %s", e)
 
@@ -367,8 +411,11 @@ def main():
     # Ensure default CR exists
     _ensure_default_cr()
 
-    # Retention getter for cleanup thread
-    current_retention = [DEFAULT_RETENTION]
+    # Retention getter for cleanup thread — seed from the CR before the thread
+    # starts, so the startup cleanup honors the configured retention instead of
+    # running once with the built-in default.
+    _, _initial_retention = _read_config()
+    current_retention = [_initial_retention]
 
     def _get_retention():
         return current_retention[0]
@@ -388,8 +435,19 @@ def main():
         current_retention[0] = retention
         logger.info("Config loaded: pollInterval=%ds, retention=%d months", poll_interval, retention)
 
-        # Read state
-        state, rv = _read_state()
+        # Self-heal the default CR if it was deleted (single GET when present)
+        _ensure_default_cr()
+
+        # Read state. A transient K8s API error here must skip the cycle, not
+        # crash the process (and must NOT be mistaken for first-run: read_configmap
+        # only returns None on a clean 404).
+        try:
+            state, rv = _read_state()
+        except Exception as e:
+            logger.error("Failed to read state ConfigMap (will retry next cycle): %s", e)
+            fileserver.write_healthz("error", None)
+            shutdown_event.wait(timeout=poll_interval)
+            continue
         first_run = state is None
 
         if first_run:
@@ -414,7 +472,8 @@ def main():
                 "lastCleanupTime": "",
             }
             try:
-                _write_state(state)
+                with _state_lock:
+                    _write_state(state)
                 rv = None  # will re-read on next cycle
             except Exception as e:
                 logger.error("Failed to write initial state: %s", e)
@@ -469,9 +528,12 @@ def main():
             logger.warning("KC event collection failed: %s", e)
             kc_health = "error"
 
-        # Write log lines (one file per day)
+        # Write log lines (one file per day). A failed write (disk full, PVC gone)
+        # must NOT advance the watermarks — the lines would be lost forever — and
+        # must NOT crash the process (a restart cannot fix a full disk).
         days = sorted(set(list(txn_lines_by_day.keys()) + list(kc_lines_by_day.keys())))
         total_lines = 0
+        write_error = None
         for day in days:
             combined = []
             combined.extend(txn_lines_by_day.get(day, []))
@@ -480,27 +542,42 @@ def main():
                 continue
             combined.sort(key=lambda x: (x[0], x[1]))
             out = Path(DATA_DIR) / f"EDA-user-events-{day}.log"
-            with out.open("a", encoding="utf-8") as fh:
-                for _, line in combined:
-                    fh.write(line + "\n")
-                    total_lines += 1
+            try:
+                with out.open("a", encoding="utf-8") as fh:
+                    for _, line in combined:
+                        fh.write(line + "\n")
+                        total_lines += 1
+            except OSError as e:
+                write_error = e
+                logger.error("Cannot write audit log %s: %s", out, e)
+                break
 
-        # Update state
-        if last_processed is not None:
-            state["lastTransactionID"] = last_processed
-            state["lastCommitTimestamp"] = last_tx_iso or ""
-        if new_event_ms > last_event_ms:
-            state["lastUserEventMs"] = new_event_ms
+        # Update state (watermarks only if every log line reached disk; the
+        # users/groups caches are always safe to persist)
+        if write_error is None:
+            if last_processed is not None:
+                state["lastTransactionID"] = last_processed
+                state["lastCommitTimestamp"] = last_tx_iso or ""
+            if new_event_ms > last_event_ms:
+                state["lastUserEventMs"] = new_event_ms
+        else:
+            poll_ok = False
         state["users"] = user_map
         state["groups"] = group_map
 
         try:
-            # Re-read to get fresh resource version
-            _, fresh_rv = _read_state()
-            if fresh_rv:
-                _write_state(state, fresh_rv)
-            else:
-                _write_state(state)
+            with _state_lock:
+                # Re-read for a fresh resourceVersion AND to preserve the cleanup
+                # thread's lastCleanupTime (that field is owned by the cleanup thread;
+                # our copy of it is from cycle start and may be stale)
+                fresh_state, fresh_rv = _read_state()
+                if fresh_state:
+                    state["lastCleanupTime"] = fresh_state.get(
+                        "lastCleanupTime", state.get("lastCleanupTime", ""))
+                if fresh_rv:
+                    _write_state(state, fresh_rv)
+                else:
+                    _write_state(state)
         except Exception as e:
             logger.error("Failed to write state: %s", e)
 
@@ -537,6 +614,10 @@ def main():
         elif last_successful_poll and (time.time() - last_successful_poll) > 3 * poll_interval:
             overall_health = "degraded"
             overall_message = f"No successful poll in {int((time.time() - last_successful_poll) / 60)} minutes"
+
+        if write_error is not None:
+            overall_health = "error"
+            overall_message = f"Cannot write audit logs to PVC: {write_error}"
 
         if c_health and (c_health == "degraded" or c_health == "error"):
             if overall_health == "ok":

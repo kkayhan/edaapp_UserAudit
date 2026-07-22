@@ -271,7 +271,10 @@ def _collect_resource_change_lines(tx_id, tx_user, tx_ts_display, user_ip):
 
         label = _resource_label(group, kind)
         ns_for_line = _resource_namespace(kind, namespace, res_name)
-        namespaces.add(ns_for_line if ns_for_line else "")
+        # Only real namespaces become nodecfg-diff query candidates — "none" is a
+        # display label, not a namespace (querying it just wastes an API call).
+        if ns_for_line != "none":
+            namespaces.add(ns_for_line)
         if action == "created":
             msg = f"{label} resource named {res_name} has been created."
         elif action == "deleted":
@@ -382,9 +385,17 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
 
     tx_id = start_id
     while missing < max_missing:
+        # ONLY a clean 404 means "this transaction id doesn't exist (yet)".
+        # Anything else (connection refused, timeout, 5xx, auth failure) must
+        # propagate: swallowing it here made a dead EDA API indistinguishable
+        # from "no new transactions", so health reported ok during full outages
+        # and the stale-poll detector never fired. The watermark is untouched on
+        # raise, so the next cycle re-scans from the same point — no loss.
         try:
             summary = auth.eda_api_get(f"core/transaction/v2/result/summary/{tx_id}")
-        except Exception:
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
             summary = None
 
         if not summary:
@@ -440,12 +451,13 @@ def discover_current_watermark():
     newest page (`page` defaults to the first page on releases that have it).
     Results are newest-first, so the watermark is the max id over whatever comes
     back (max() keeps it correct even if a release returns them in another order).
+
+    Raises on API failure — the caller's first-run handler retries next interval.
+    (Returning 0 on failure, as this used to, silently set the watermark to 0 on
+    a transient outage and the next healthy cycle then replayed the ENTIRE
+    transaction history from id 1.) A genuinely empty system still returns 0.
     """
-    try:
-        summary = auth.eda_api_get("core/transaction/v2/result/summary?size=1") or {}
-        results = summary.get("results") or []
-        ids = [int(r.get("id", 0)) for r in results if r.get("id") is not None]
-        return max(ids) if ids else 0
-    except Exception as e:
-        logger.warning("Failed to discover transaction watermark, starting from 0: %s", e)
-        return 0
+    summary = auth.eda_api_get("core/transaction/v2/result/summary?size=1") or {}
+    results = summary.get("results") or []
+    ids = [int(r.get("id", 0)) for r in results if r.get("id") is not None]
+    return max(ids) if ids else 0
