@@ -112,16 +112,6 @@ def create_or_update_secret(name, namespace, string_data, secret_type="Opaque"):
     return _request("PUT", one, body)
 
 
-def read_service(name, namespace="eda-system"):
-    path = f"/api/v1/namespaces/{quote(namespace, safe='')}/services/{quote(name, safe='')}"
-    try:
-        return _request("GET", path)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        raise
-
-
 def read_cr(group, version, plural, name):
     path = f"/apis/{group}/{version}/{plural}/{quote(name, safe='')}"
     try:

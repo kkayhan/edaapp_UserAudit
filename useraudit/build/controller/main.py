@@ -14,7 +14,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "v26.4.1-9"
+VERSION = "v26.4.1-10"
 DATA_DIR = "/data/logs"
 NAMESPACE = os.environ.get("POD_NAMESPACE", "eda-system")
 CRD_GROUP = "useraudit.eda.edacommunity.com"
@@ -77,36 +77,6 @@ def _read_config():
     except Exception as e:
         logger.warning("Failed to read UserAuditConfig: %s", e)
     return DEFAULT_POLL_INTERVAL, DEFAULT_RETENTION
-
-
-# ----------------------------- SFTP sidecar support ---------------------------------
-
-SFTP_SERVICE = "eda-useraudit-sftp"
-
-
-def _sftp_endpoint():
-    """Build a human-readable endpoint string from the SFTP Service state."""
-    import k8s
-    try:
-        svc = k8s.read_service(SFTP_SERVICE, NAMESPACE)
-        if not svc:
-            return ""
-        spec = svc.get("spec", {})
-        ports = spec.get("ports") or [{}]
-        port = ports[0].get("port", 22522)
-        svc_type = spec.get("type", "")
-        if svc_type == "LoadBalancer":
-            ingress = (((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or [])
-            if ingress and ingress[0].get("ip"):
-                return f"readonly@{ingress[0]['ip']} port {port}"
-            return f"pending external IP (port {port})"
-        if svc_type == "NodePort":
-            node_port = ports[0].get("nodePort", "")
-            return f"readonly@<node-ip> port {node_port}"
-        return f"readonly@{SFTP_SERVICE}.{NAMESPACE}.svc port {port} (cluster-internal)"
-    except Exception as e:
-        logger.warning("SFTP endpoint lookup failed: %s", e)
-        return ""
 
 
 def _ensure_default_cr():
@@ -189,7 +159,7 @@ def _write_state(state, resource_version=None):
 # ----------------------------- CRD status updates -----------------------------------
 
 def _update_crd_status(health, message, last_poll_time, last_tx_id, last_event_ms,
-                       txns_processed, kc_events_processed, subsystems, sftp_endpoint=""):
+                       txns_processed, kc_events_processed, subsystems):
     """Update UserAuditConfig CRD status subresource. Fully guarded — status
     reporting must never take down the poll loop."""
     import k8s
@@ -222,7 +192,6 @@ def _update_crd_status(health, message, last_poll_time, last_tx_id, last_event_m
         "kcEventsProcessed": kc_events_processed,
         "logFiles": log_files,
         "subsystems": subsystems,
-        "sftpEndpoint": sftp_endpoint,
         "version": VERSION,
     }
 
@@ -482,8 +451,7 @@ def main():
             _update_crd_status("ok", "Initialized — first poll cycle starting",
                               datetime.now(timezone.utc).isoformat(timespec="seconds"),
                               current_tx_id, now_ms, total_txns, total_kc_events,
-                              {"edaApi": "ok", "keycloakEvents": "ok"},
-                              _sftp_endpoint())
+                              {"edaApi": "ok", "keycloakEvents": "ok"})
             shutdown_event.wait(timeout=min(10, poll_interval))  # Short wait before first real poll
             continue
 
@@ -630,7 +598,6 @@ def main():
             state.get("lastTransactionID", 0),
             state.get("lastUserEventMs", 0),
             total_txns, total_kc_events, subsystems,
-            _sftp_endpoint(),
         )
 
         # Write healthz

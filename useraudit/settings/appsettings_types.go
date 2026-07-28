@@ -30,24 +30,6 @@ type AppSettingsSpec struct {
 	// +kubebuilder:default="500Mi"
 	// +eda:ui:title="Audit log storage size"
 	LogStorageSize string `json:"logStorageSize,omitempty"`
-
-	// TCP port on which the read-only SFTP endpoint is exposed outside the
-	// cluster. The default is intentionally an uncommon port so it cannot
-	// collide with services that may claim well-known ports later.
-	// +kubebuilder:default=22522
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=65535
-	// +eda:ui:title="SFTP port"
-	SftpPort int `json:"sftpPort,omitempty"`
-
-	// Kubernetes Service type for the SFTP endpoint. "LoadBalancer" joins
-	// the shared MetalLB VIP (recommended where EDA already uses one);
-	// "NodePort" exposes a high port on the node IP instead; "ClusterIP"
-	// keeps SFTP reachable only inside the cluster.
-	// +kubebuilder:default="LoadBalancer"
-	// +kubebuilder:validation:Enum=LoadBalancer;NodePort;ClusterIP
-	// +eda:ui:title="SFTP service type"
-	SftpServiceType string `json:"sftpServiceType,omitempty"`
 }
 
 // +kubebuilder:object:root=true

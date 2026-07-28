@@ -6,7 +6,7 @@ A Nokia **EDA** app that turns the EDA cluster into a system-of-record for **who
 - every **sign-in and sign-out** to the EDA GUI
 - every **administrative change** in Keycloak (user / group / role management)
 
-All events are written to daily log files (`EDA-user-events-YYYY-MM-DD.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint and a read-only SFTP endpoint (port 22522 by default, user `readonly`, password auth) — no scraping, no parsing, no extra tooling.
+All events are written to daily log files (`EDA-user-events-YYYY-MM-DD.log`) on a **persistent volume inside the cluster**, so they survive controller restarts, upgrades, and node reboots. Logs are exposed read-only over a simple HTTP endpoint — no scraping, no parsing, no extra tooling.
 
 A typical line looks like this:
 
@@ -87,18 +87,15 @@ curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
 curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/EDA-user-events-2026-05-04.log
 ```
 
-### SFTP endpoint
+### Need SFTP? Relay it from outside the cluster
 
-The same logs are also served over **read-only SFTP** for collectors that speak SFTP natively (SIEM pullers, compliance archivers, plain `sftp`/WinSCP/FileZilla). SFTP runs over SSH, so it uses its own port (default **22522**, an install-time setting) rather than the EDA HttpProxy. The login user is `readonly` (default password `readonly`), password-authenticated; the session is chroot-jailed to the log directory with no shell and no write access.
+The app deliberately exposes **HTTP(S) only**. Versions v26.4.1-6 … v26.4.1-9 also shipped an in-pod SFTP sidecar; it was **removed in v26.4.1-10** in favour of relaying from a host outside the cluster, because that:
 
-```bash
-# Confirm / change the password (stored in the useraudit-sftp Secret, defaults to "readonly"):
-kubectl -n eda-system get secret useraudit-sftp -o jsonpath='{.data.password}' | base64 -d
+- keeps the app to a single container and a single protocol — no SSH daemon, no host keys, no extra Service on the EDA VIP, and no default credentials shipped with the app;
+- puts the audit copy **off-cluster**, so it survives loss of the cluster — which is exactly what an audit trail needs;
+- lets the SFTP account, password policy, and retention be owned by whoever owns the relay host, not baked into an app manifest.
 
-# Connect (live address is in CRD status.sftpEndpoint). The two -o options keep your
-# SSH client from saving the host key, so a later app reinstall won't need a known_hosts cleanup:
-sftp -P 22522 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null readonly@<eda-vip>
-```
+The pattern is a small cron job on any Linux host that can reach EDA over HTTPS: pull with the two calls above into a directory, then serve that directory over the host's own SFTP. Since the listing reports `size_bytes`, a puller only needs to re-fetch files whose size changed — the current day's file grows, finished days are frozen. Write to a temp file and `mv` into place so a collector never reads a half-written file. [`logs/pull-audit-logs.sh`](logs/pull-audit-logs.sh) is a working starting point.
 
 ### Helper script
 
