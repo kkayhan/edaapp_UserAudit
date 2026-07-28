@@ -111,7 +111,38 @@ def ensure_events_enabled():
 # ----------------------------- Event fetching (from edalogger.py 265-314) -------------
 
 _ALLOWED_LOGIN_EVENTS = {"LOGIN", "LOGOUT"}
-_ALLOWED_ADMIN_RESOURCE_TYPES = {"USER", "GROUP", "CLIENT_ROLE", "USER_FEDERATION", "COMPONENT", "REALM_ROLE", "REALM"}
+
+# Resource types SENT TO KEYCLOAK. Every entry MUST be a real constant of
+# org.keycloak.events.admin.ResourceType — Keycloak resolves the query param with
+# ResourceType.valueOf(), so ONE unknown value makes the whole admin-events request
+# throw HTTP 500. That is what `USER_FEDERATION` (not a constant; the real ones are
+# USER_FEDERATION_PROVIDER / USER_FEDERATION_MAPPER, and modern Keycloak stores LDAP
+# config as COMPONENT) did up to v26.4.1-8: the 500 permanently disabled server-side
+# filtering, so every poll refetched ALL resource types. Verified against the enum in
+# the shipped org.keycloak.keycloak-server-spi-private jar on the live cluster.
+#
+# *_ROLE_MAPPING and GROUP_MEMBERSHIP are the types Keycloak emits when a role is
+# granted/revoked or a user is added to/removed from a group — i.e. privilege changes.
+# They were absent before v26.4.1-9, so privilege escalation was invisible to the audit.
+_ADMIN_RESOURCE_TYPES_WIRE = [
+    "USER",
+    "GROUP",
+    "GROUP_MEMBERSHIP",
+    "REALM_ROLE_MAPPING",
+    "CLIENT_ROLE_MAPPING",
+    "CLIENT_ROLE",
+    "COMPONENT",
+    "REALM",
+    "USER_FEDERATION_PROVIDER",
+    "USER_FEDERATION_MAPPER",
+]
+# Client-side accept set (re-applied after fetching, and the only filter in effect if
+# Keycloak ever rejects the server-side one).
+_ALLOWED_ADMIN_RESOURCE_TYPES = set(_ADMIN_RESOURCE_TYPES_WIRE)
+# Types whose events are only interesting when they describe an LDAP federation provider.
+_LDAP_RESOURCE_TYPES = {"COMPONENT", "USER_FEDERATION_PROVIDER", "USER_FEDERATION_MAPPER"}
+# Privilege-change types: always audited, never LDAP-gated.
+_PRIVILEGE_RESOURCE_TYPES = {"REALM_ROLE_MAPPING", "CLIENT_ROLE_MAPPING", "GROUP_MEMBERSHIP"}
 _ALLOWED_ADMIN_OPS = {"CREATE", "UPDATE", "DELETE"}
 
 # Keycloak on some EDA releases (e.g. 26.4.1) returns HTTP 500 when the admin-events
@@ -121,39 +152,94 @@ _ALLOWED_ADMIN_OPS = {"CREATE", "UPDATE", "DELETE"}
 _resource_types_filter_ok = [True]
 
 
-def _kc_fetch_login_logout_events(page_size=500) -> List[Dict]:
-    params = [("max", page_size)]
+_PAGE_SIZE = 500
+_MAX_PAGES = 40          # hard ceiling: 20 000 events per subsystem per cycle
+
+
+def _kc_fetch_paged(base_path: str, base_params: List, last_event_ms: int,
+                    what: str, page_size: int = _PAGE_SIZE) -> List[Dict]:
+    """Fetch events newest-first, paging with `first` until we reach the watermark.
+
+    Up to v26.4.1-8 both fetchers sent a bare `max=500` with no paging and no
+    watermark anchor. Keycloak returns events NEWEST-first, so whenever more than
+    500 events arrived between two polls, the OLDEST of them fell off the end of
+    the window and were dropped — silently, because the watermark then advanced to
+    the newest event seen and nothing re-reads older ids. A login storm, a burst of
+    automation, or any backlog after a Keycloak/pod outage therefore lost exactly
+    the events an auditor most wants. We now keep paging until the page we just read
+    reaches back past the persisted watermark, and shout if we hit the ceiling.
+    """
+    out: List[Dict] = []
+    seen = set()
+    first = 0
+    for page in range(_MAX_PAGES):
+        params = list(base_params) + [("first", first), ("max", page_size)]
+        batch = auth.kc_admin_get(f"{base_path}?{urlencode(params, doseq=True)}") or []
+        for e in batch:
+            # Keycloak re-evaluates the query on every request and returns newest-first,
+            # so any event created between two page requests shifts the window right and
+            # page N+1 re-returns the tail of page N. Without identity-dedup those events
+            # would be written to the audit log twice — nothing downstream de-duplicates
+            # (the watermark filter only rejects events at or before the CYCLE-START
+            # watermark, so every copy of a genuinely new event passes).
+            key = e.get("id") or json.dumps(e, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+        # Paging decisions below must use the RAW batch, never `out`: a page that is full
+        # but entirely duplicate would otherwise look short and end the scan early.
+        if len(batch) < page_size:
+            return out                      # reached the end of the feed
+        if not last_event_ms:
+            return out                      # no watermark yet (first run): one page is enough
+        oldest = min((int(e.get("time") or 0) for e in batch), default=0)
+        if oldest <= last_event_ms:
+            return out                      # paged back past the watermark: nothing older is new
+        first += page_size
+    logger.warning(
+        "%s: hit the %d-page ceiling (%d events) while still newer than the watermark — "
+        "older events in this window may be missed. Lower pollIntervalSeconds if this repeats.",
+        what, _MAX_PAGES, len(out))
+    return out
+
+
+def _kc_fetch_login_logout_events(last_event_ms: int = 0, page_size=_PAGE_SIZE) -> List[Dict]:
+    params = []
     for t in sorted(_ALLOWED_LOGIN_EVENTS):
         params.append(("type", t))
-    path = f"/admin/realms/eda/events?{urlencode(params, doseq=True)}"
-    return auth.kc_admin_get(path) or []
+    return _kc_fetch_paged("/admin/realms/eda/events", params, last_event_ms,
+                           "login/logout events", page_size)
 
 
-def _kc_fetch_admin_events(page_size=500) -> List[Dict]:
+def _kc_fetch_admin_events(last_event_ms: int = 0, page_size=_PAGE_SIZE) -> List[Dict]:
     """Fetch admin events. Raises on fetch failure — the caller propagates it so
     kc_health reflects a Keycloak outage (a silent [] here reported 'ok' while
     blind). Only the documented 26.4.1 quirk — HTTP 500 on the resourceTypes
     filter — is handled, by retrying without the filter and not sending it again
     (filtering is re-applied client-side by _filter_admin_events)."""
-    base_params = [("max", page_size)]
+    base_params = []
     for op in sorted(_ALLOWED_ADMIN_OPS):
         base_params.append(("operationTypes", op))
 
     def _do(params):
-        path = f"/admin/realms/eda/admin-events?{urlencode(params, doseq=True)}"
-        return auth.kc_admin_get(path) or []
+        return _kc_fetch_paged("/admin/realms/eda/admin-events", params, last_event_ms,
+                               "admin events", page_size)
 
     if _resource_types_filter_ok[0]:
         params = list(base_params)
-        for rt in sorted(_ALLOWED_ADMIN_RESOURCE_TYPES):
+        for rt in sorted(_ADMIN_RESOURCE_TYPES_WIRE):
             params.append(("resourceTypes", rt))
         try:
             return _do(params)
         except urllib.error.HTTPError as e:
             if e.code != 500:
                 raise
-            logger.info("Keycloak rejected the admin-events resourceTypes filter (HTTP 500); "
-                        "fetching all resource types and filtering client-side from now on")
+            # Should no longer happen: the 500 was caused by the invalid constant
+            # USER_FEDERATION in the wire list (removed in v26.4.1-9). Kept as a
+            # belt-and-braces fallback for any release with a narrower enum.
+            logger.warning("Keycloak rejected the admin-events resourceTypes filter (HTTP 500); "
+                           "fetching all resource types and filtering client-side from now on")
             _resource_types_filter_ok[0] = False
     return _do(base_params)
 
@@ -272,7 +358,7 @@ def _extract_group_target(ev: Dict) -> Tuple[Optional[str], Optional[str]]:
 
 def _is_ldap_provider_event(ev: Dict) -> bool:
     rt = (ev.get("resourceType") or "").upper()
-    if rt not in {"USER_FEDERATION", "COMPONENT"}:
+    if rt not in _LDAP_RESOURCE_TYPES:
         return False
     rep = ev.get("representation")
     if rep:
@@ -295,10 +381,14 @@ def _filter_admin_events(admin_events: List[Dict]) -> List[Dict]:
         if op not in _ALLOWED_ADMIN_OPS:
             continue
         if rt == "REALM_ROLE":
+            # role DEFINITION create/update/delete — noise; the grant is what matters
+            # and that arrives as REALM_ROLE_MAPPING (audited below).
             continue
         if rt in {"USER", "GROUP", "CLIENT_ROLE", "REALM"}:
             out.append(ev)
-        elif rt in {"USER_FEDERATION", "COMPONENT"}:
+        elif rt in _PRIVILEGE_RESOURCE_TYPES:
+            out.append(ev)
+        elif rt in _LDAP_RESOURCE_TYPES:
             if _is_ldap_provider_event(ev):
                 out.append(ev)
     return out
@@ -357,7 +447,7 @@ def _format_admin_event_line(ev: Dict, user_lookup=None,
         return None
     if rt not in _ALLOWED_ADMIN_RESOURCE_TYPES:
         return None
-    if rt in {"USER_FEDERATION", "COMPONENT"} and not _is_ldap_provider_event(ev):
+    if rt in _LDAP_RESOURCE_TYPES and not _is_ldap_provider_event(ev):
         return None
 
     auth_details = ev.get("authDetails") or {}
@@ -426,8 +516,55 @@ def _format_admin_event_line(ev: Dict, user_lookup=None,
         # own event-enablement PUT on first install.
         line = (f"{display_ts} | Event=REALM-{op} | User={actor} | IPADDR={ip} | "
                 f"Realm settings have been modified.")
+    elif rt in _PRIVILEGE_RESOURCE_TYPES:
+        # Privilege changes: who granted/revoked what, to whom. resourcePath carries the
+        # subject, e.g. "users/<uuid>/role-mappings/realm" or "users/<uuid>/groups/<gid>".
+        subject_id = None
+        subject_kind = None      # a role can be granted to a GROUP as well as a user
+        parts = [p for p in (ev.get("resourcePath") or "").split("/") if p]
+        if len(parts) >= 2 and parts[0] in ("users", "groups"):
+            subject_id = parts[1]
+            subject_kind = "user" if parts[0] == "users" else "group"
+        subject_label = subject_id or "unknown"
+        if subject_id and parts[0] == "users":
+            if user_target_cache is not None and subject_id in user_target_cache:
+                subject_label = user_target_cache.get(subject_id) or subject_id
+            elif user_lookup:
+                subject_label = user_lookup(subject_id) or subject_id
+        elif subject_id and parts[0] == "groups":
+            if group_target_cache is not None and subject_id in group_target_cache:
+                subject_label = group_target_cache.get(subject_id) or subject_id
+            elif group_lookup:
+                subject_label = group_lookup(subject_id) or subject_id
+        # The granted role / group name lives in the representation payload.
+        granted = []
+        rep = ev.get("representation")
+        if rep:
+            try:
+                rep_obj = json.loads(rep)
+                for item in (rep_obj if isinstance(rep_obj, list) else [rep_obj]):
+                    if isinstance(item, dict):
+                        nm = item.get("name") or item.get("clientRole") or item.get("path")
+                        if nm:
+                            granted.append(str(nm))
+            except Exception:
+                pass
+        what = ", ".join(granted) if granted else resource_path
+        if rt == "GROUP_MEMBERSHIP":
+            verb = {"CREATE": "added to", "DELETE": "removed from"}.get(op, "changed for")
+            line = (f"{display_ts} | Event=GROUPMEMBERSHIP-{op} | User={actor} | IPADDR={ip} | "
+                    f"User {subject_label} has been {verb} group {what}.")
+        else:
+            scope = "client role" if rt == "CLIENT_ROLE_MAPPING" else "realm role"
+            verb = {"CREATE": "granted to", "DELETE": "revoked from"}.get(op, "changed for")
+            # Never hardcode "user": Keycloak exposes groups/<gid>/role-mappings too, and a
+            # role granted to a GROUP privileges every current and future member. Calling
+            # that a user would misstate both the subject and the blast radius.
+            noun = subject_kind or "subject"
+            line = (f"{display_ts} | Event=ROLEMAPPING-{op} | User={actor} | IPADDR={ip} | "
+                    f"Keycloak {scope} {what} has been {verb} {noun} {subject_label}.")
     else:
-        descriptor = f"LDAP-{op}" if rt in {"USER_FEDERATION", "COMPONENT"} else f"{rt}-{op}"
+        descriptor = f"LDAP-{op}" if rt in _LDAP_RESOURCE_TYPES else f"{rt}-{op}"
         line = (f"{display_ts} | Event=Keycloak-{descriptor} | User={actor} | IPADDR={ip} | "
                 f"Resource={resource_path}")
 
@@ -453,8 +590,8 @@ def collect_keycloak_user_logs(last_event_ms: int,
     # of reporting "All systems operational" while blind. The event watermark is
     # untouched on raise, so the next cycle re-fetches — nothing is lost (within
     # the documented 500-event cap).
-    login_events = _kc_fetch_login_logout_events()
-    admin_events_raw = _kc_fetch_admin_events()
+    login_events = _kc_fetch_login_logout_events(last_event_ms)
+    admin_events_raw = _kc_fetch_admin_events(last_event_ms)
 
     admin_events = _filter_admin_events(admin_events_raw)
     for ev in admin_events:

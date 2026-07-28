@@ -433,11 +433,33 @@ def invalidate_kc_token():
     _kc_admin_token_cache[1] = 0
 
 
+class AuthError(RuntimeError):
+    """Failure while ACQUIRING a token, as opposed to a failure of the requested endpoint.
+
+    Callers distinguish outcomes by HTTP status: transaction.py treats a 404 as proof that
+    a transaction id does not exist. The auth stack can itself raise HTTPError(404) — a
+    mis-routed Keycloak base, or a momentarily absent keycloak-admin-secret via
+    k8s.read_secret — and up to v26.4.1-8 that escaped raw, so an auth outage was read as
+    "this transaction does not exist": the id was skipped, the watermark advanced past it,
+    and the record was lost silently while health still said ok. Wrapping token failures in
+    a NON-HTTPError type makes them impossible to mistake for an endpoint 404; they
+    propagate, the poll cycle fails loudly, and the watermark stays put for a clean retry.
+    """
+
+
+def _token(**kwargs):
+    """Acquire a token, converting any auth-stack HTTP failure into AuthError."""
+    try:
+        return get_eda_api_token(**kwargs)
+    except urllib.error.HTTPError as e:
+        raise AuthError(f"EDA API token acquisition failed: HTTP {e.code} from {e.url}") from e
+
+
 def eda_api_get(path_qs):
     """GET against the EDA API server. Retries once on 401 (stale token) and once on 403
     (role drift: a valid stored secret whose SA lost its roles — re-provision re-grants them)."""
     url = _EDA_API_BASE.rstrip("/") + "/" + path_qs.lstrip("/")
-    token = get_eda_api_token()
+    token = _token()
     ssl_ctx = get_ssl_context()
     try:
         return http_json("GET", url,
@@ -447,12 +469,12 @@ def eda_api_get(path_qs):
         if e.code == 401:
             logger.warning("EDA API 401 — refreshing token and retrying")
             invalidate_eda_token()
-            token = get_eda_api_token(force=True)
+            token = _token(force=True)
         elif e.code == 403:
             logger.warning("EDA API 403 — service account may have lost %s; re-provisioning %s "
                            "and retrying", _EDA_ROLE, _SVC_CLIENT_ID)
             invalidate_eda_token()
-            token = get_eda_api_token(force=True, reprovision=True)
+            token = _token(force=True, reprovision=True)
         else:
             raise
         return http_json("GET", url,
@@ -468,7 +490,7 @@ def kc_admin_get(path):
     NOTE: the URL is built AFTER the first token acquisition — get_eda_api_token() runs
     _ensure_kc_base(), and on the first call of the process _KC_BASE may change under us."""
     ssl_ctx = get_ssl_context()
-    token = get_eda_api_token()          # pins the KC base before we read _KC_BASE
+    token = _token()                     # pins the KC base before we read _KC_BASE
     url = _KC_BASE + path
     try:
         return http_json("GET", url,
@@ -478,12 +500,12 @@ def kc_admin_get(path):
         if e.code == 401:
             logger.warning("KC admin 401 — refreshing service-account token and retrying")
             invalidate_eda_token()
-            token = get_eda_api_token(force=True)
+            token = _token(force=True)
         elif e.code == 403:
             logger.warning("KC admin 403 — service account may have lost realm-management roles; "
                            "re-provisioning %s and retrying", _SVC_CLIENT_ID)
             invalidate_eda_token()
-            token = get_eda_api_token(force=True, reprovision=True)
+            token = _token(force=True, reprovision=True)
         else:
             raise
         return http_json("GET", url,
@@ -496,7 +518,7 @@ def kc_admin_put(path, body_dict):
     Same 401/403 retry semantics — and same URL-after-token ordering — as kc_admin_get."""
     ssl_ctx = get_ssl_context()
     data = json.dumps(body_dict).encode("utf-8")
-    token = get_eda_api_token()          # pins the KC base before we read _KC_BASE
+    token = _token()                     # pins the KC base before we read _KC_BASE
     url = _KC_BASE + path
 
     def _put(tok):
@@ -512,11 +534,11 @@ def kc_admin_put(path, body_dict):
         if e.code == 401:
             logger.warning("KC admin PUT 401 — refreshing service-account token and retrying")
             invalidate_eda_token()
-            _put(get_eda_api_token(force=True))
+            _put(_token(force=True))
         elif e.code == 403:
             logger.warning("KC admin PUT 403 — service account may have lost manage-realm; "
                            "re-provisioning %s and retrying", _SVC_CLIENT_ID)
             invalidate_eda_token()
-            _put(get_eda_api_token(force=True, reprovision=True))
+            _put(_token(force=True, reprovision=True))
         else:
             raise

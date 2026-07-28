@@ -7,6 +7,7 @@ import difflib
 import json
 import logging
 import re
+import time
 import urllib.error
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
@@ -370,6 +371,33 @@ def collect_transaction_lines(tx_id, tx_user, tx_ts_display, tx_iso, user_ip):
 
 # ----------------------------- Poll transactions (adapted from run_once) ---------------
 
+# EDA transaction states (core OpenAPI: TransactionState.state).
+_STATE_COMPLETE = "complete"      # the ONLY terminal state
+_STATE_UNKNOWN = "unknownTid"     # id does not exist
+
+# A transaction that never reaches `complete` must not block auditing forever.
+# In-memory only: after a restart the timer simply starts again, which is safe.
+_STUCK_TIMEOUT_SECONDS = 3600
+_deferred_since = {}
+
+
+def _mark_deferred(tx_id):
+    _deferred_since.setdefault(tx_id, time.monotonic())
+
+
+def _stuck_seconds(tx_id):
+    started = _deferred_since.get(tx_id)
+    return 0 if started is None else int(time.monotonic() - started)
+
+
+def _clear_deferred(tx_id):
+    _deferred_since.pop(tx_id, None)
+
+
+def user_ip_placeholder():
+    return "N/A"
+
+
 def poll_transactions(last_tx_id, event_window_seconds=3600):
     """
     Poll for new transactions starting from last_tx_id+1.
@@ -403,6 +431,24 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
             tx_id += 1
             continue
 
+        # The summary endpoint ROUNDS UP: an id below the current maximum that no
+        # longer exists (EDA purges old transactions) is answered with HTTP 200 and
+        # the NEXT SURVIVING transaction's record — a different `id`. Only ids above
+        # the maximum give a clean 404. Trusting the probe id (<= v26.4.1-8) fabricated
+        # one audit record per purged id, each carrying the later transaction's user,
+        # timestamp and changes. Always believe the id the API returns.
+        returned_id = summary.get("id")
+        if isinstance(returned_id, int) and returned_id != tx_id:
+            if returned_id < tx_id:
+                # never observed; never walk backwards over already-audited ids
+                logger.warning("summary/%d returned older id %d — ignoring", tx_id, returned_id)
+                missing += 1
+                tx_id += 1
+                continue
+            logger.info("Transactions %d-%d no longer exist (purged); continuing at %d",
+                        tx_id, returned_id - 1, returned_id)
+            tx_id = returned_id
+
         missing = 0
         tx_user = summary.get("username", "")
         tx_time = summary.get("lastChangeTimestamp", "")
@@ -410,6 +456,43 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
         tx_dry_run = bool(summary.get("dryRun"))
         tx_state = summary.get("state", "")
         tx_iso, tx_ts_display, tx_ms = kc._normalize_iso_ts(tx_time)
+
+        # EDA transaction states are: unknownTid | queued | running | complete
+        # (core OpenAPI TransactionState). Only `complete` is TERMINAL — a failure is
+        # `complete` + success=false, there is no separate failed state.
+        if tx_state == _STATE_UNKNOWN:
+            missing += 1
+            tx_id += 1
+            continue
+
+        if tx_state != _STATE_COMPLETE:
+            # Still executing. Up to v26.4.1-8 this fell into the `not success` branch
+            # and was permanently written as "Failed transaction attempt, no changes
+            # were made" while the watermark advanced past it — a false record AND the
+            # real changes lost forever. Measured window: ~4 s per transaction.
+            # Emit nothing and stop the scan so the watermark stays put; the next cycle
+            # re-reads this id once it has settled.
+            if _stuck_seconds(tx_id) < _STUCK_TIMEOUT_SECONDS:
+                _mark_deferred(tx_id)
+                logger.info("Transaction %d is '%s' — deferring to the next poll cycle", tx_id, tx_state)
+                break
+            # Safety valve: never let one wedged transaction block auditing forever.
+            logger.warning("Transaction %d still '%s' after %ds — advancing past it",
+                           tx_id, tx_state, _STUCK_TIMEOUT_SECONDS)
+            _clear_deferred(tx_id)
+            log_lines = [format_status_line(
+                tx_ts_display, tx_id, tx_user, user_ip_placeholder(),
+                f"Transaction still in state '{tx_state}' after {_STUCK_TIMEOUT_SECONDS}s; "
+                f"its changes (if any) were not audited.")]
+            day = kc._day_key(tx_iso)
+            txn_lines_by_day.setdefault(day, []).extend((tx_ms, line) for line in log_lines)
+            last_processed = tx_id
+            last_tx_iso = tx_iso
+            tx_count += 1
+            tx_id += 1
+            continue
+
+        _clear_deferred(tx_id)
 
         user_ip = "N/A"
         try:
@@ -422,7 +505,9 @@ def poll_transactions(last_tx_id, event_window_seconds=3600):
         if tx_dry_run:
             log_lines = [format_status_line(tx_ts_display, tx_id, tx_user, user_ip,
                                             "Dryrun , no changes were made on the system or the nodes.")]
-        elif not tx_success or tx_state != "complete":
+        elif not tx_success:
+            # state is guaranteed `complete` here, so this is a GENUINE failure
+            # (the in-flight case was handled above and never reaches this branch).
             log_lines = [format_status_line(tx_ts_display, tx_id, tx_user, user_ip,
                                             "Failed transaction attempt, no changes were made on the system or the nodes.")]
         else:
