@@ -113,17 +113,14 @@ The app's HttpProxy uses `authType: inApiServer`, which makes the **EDA API serv
 1. **Authentication.** A valid Keycloak bearer token must be present. Without one the request is rejected with `HTTP 400 InvalidAuthHeader` — there is no anonymous access and no separate app password to manage.
 2. **Authorization.** EDA applies its own RBAC to the URL. Reaching `/core/httpproxy/v1/useraudit/**` requires a **URL rule** covering that path, and the only role shipped with a matching rule is the default `system-administrator` `ClusterRole` (`urlRules: [{path: /**, permissions: readWrite}]`). Roles are assigned through user groups, so in practice access means **membership of the `system-administrator` group**. Anyone else is authenticated but rejected with `HTTP 403`.
 
-**Give collectors their own account — not admin.** Membership of `system-administrator` cannot be attenuated: the group exists to carry a role granting `resourceRules: * readWrite` and `urlRules: /** readWrite`, so a "read-only" member is a contradiction — they get full write access to EDA. A cron job that pulls log files should not hold that. Create a dedicated role, group, and user instead (roles attach to **groups**, never directly to users, so all three are needed):
+**Give collectors their own account — not admin.** Membership of `system-administrator` cannot be attenuated: the group exists to carry a role granting `resourceRules: * readWrite` and `urlRules: /** readWrite`, so a "read-only" member is a contradiction — they get full write access to EDA. A cron job that pulls log files should not hold that.
+
+The app installs a **`useraudit-reader`** ClusterRole for exactly this purpose. It grants read on `/core/httpproxy/v1/useraudit` and nothing else — no `resourceRules`, no `tableRules` — and is removed when the app is uninstalled.
+
+The **group and user are not shipped and cannot be**: EDA keeps users and groups in Keycloak rather than Kubernetes, so there is no resource for the app to install. An administrator creates them once and chooses the password; the app never sees, stores, or defaults it. And because EDA attaches roles to **groups, never to users**, granting `useraudit-readonly` the role always means creating a group that holds it:
 
 ```bash
-# role -> group -> user, via EDA's admin API as an administrator.
-# The role grants ONLY this endpoint: no resourceRules, no tableRules.
-curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$EDA/core/admin/roles" -d '{"name":"useraudit-reader","namespace":"eda-system",
-    "description":"Read the EDA User Audit log endpoint and nothing else.",
-    "urlRules":[{"path":"/core/httpproxy/v1/useraudit","permissions":"read"},
-                {"path":"/core/httpproxy/v1/useraudit/**","permissions":"read"}]}'
-
+# group -> attach shipped role -> user -> membership -> password
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   "$EDA/core/admin/groups" -d '{"name":"useraudit-readers","description":"Members may read the User Audit log endpoint only."}'
 GUUID=$(curl -sk -H "Authorization: Bearer $TOKEN" "$EDA/core/admin/groups" | jq -r '.[]|select(.name=="useraudit-readers").uuid')
@@ -140,7 +137,9 @@ curl -sk -X PUT  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application
   "$EDA/core/admin/users/$UUUID/resetpassword" -d '{"value":"<password>","temporary":false}'
 ```
 
-The same is available in the UI under **System Administration → User Management**. Each of these returns `400` if you try to shortcut it: a group cannot be created with `roles`, a user cannot be created with `groups` or `password`, `email`/`firstName`/`lastName` are mandatory, and Keycloak rejects punctuation (e.g. parentheses) in first/last names.
+The same is available in the UI under **System Administration → User Management**: create the group, assign it the `useraudit-reader` role, create the user, add it to the group. Each of these returns `400` if you try to shortcut it: a group cannot be created with `roles`, a user cannot be created with `groups` or `password`, `email`/`firstName`/`lastName` are mandatory, and Keycloak rejects punctuation (e.g. parentheses) in first/last names.
+
+This is the intended setup for the **SFTP relay** described above: the relay host holds the `useraudit-readonly` credentials, pulls on a timer, and serves its own local copy over SFTP — no EDA administrator account anywhere in that path.
 
 The collector then needs no Keycloak admin credentials — only the account and the `eda` client secret:
 

@@ -1,0 +1,42 @@
+# EDA RBAC (core.eda.nokia.com), NOT Kubernetes RBAC -- see rbac.yaml for the
+# controller pod's Kubernetes permissions.
+#
+# The app's HttpProxy uses authType: inApiServer, so the EDA API server authorizes
+# every request to /core/httpproxy/v1/useraudit against EDA RBAC url-rules before
+# forwarding. Unmatched requests are implicitly denied, and the only role shipped
+# with EDA that matches is system-administrator (/**, readWrite).
+#
+# This role exists so a NON-administrator machine account can read the audit log
+# without being made an administrator. It grants that one endpoint and nothing
+# else: no resourceRules (no EDA resources) and no tableRules (no EDB/EQL access).
+#
+# EDA binds roles to USER GROUPS, never directly to users, and both groups and
+# users live in Keycloak rather than Kubernetes -- so they cannot ship with the
+# app. After installing, an administrator completes the setup manually (once):
+#
+#   1. Create a user group, e.g. "useraudit-readers", and assign it this role.
+#   2. Create a user "useraudit-readonly", set its password, add it to that group.
+#
+# Both steps are available in the UI under System Administration > User Management,
+# or via the EDA API (/core/admin/groups, /core/admin/users). The app never sees or
+# stores that password -- the administrator chooses it.
+#
+# Access to the endpoint is therefore: the system-administrator group, plus any
+# group holding this role. Everyone else is rejected (400 without a token, 403
+# with one).
+apiVersion: core.eda.nokia.com/v1
+kind: ClusterRole
+metadata:
+  name: useraudit-reader
+  namespace: eda-system
+spec:
+  description: >-
+    Read the EDA User Audit log endpoint and nothing else. Intended for machine
+    accounts (for example an SFTP relay host) that pull audit logs. Assign to a
+    user group; EDA roles cannot be assigned to users directly.
+  # Both entries are needed: /** matches the subtree, not the bare path.
+  urlRules:
+    - path: /core/httpproxy/v1/useraudit
+      permissions: read
+    - path: /core/httpproxy/v1/useraudit/**
+      permissions: read
