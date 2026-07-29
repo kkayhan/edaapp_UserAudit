@@ -116,19 +116,19 @@ The app's HttpProxy uses `authType: inApiServer`, which makes the **EDA API serv
 **Give collectors their own account — not admin.** Membership of `system-administrator` cannot be attenuated: the group exists to carry a role granting `resourceRules: * readWrite` and `urlRules: /** readWrite`, so a "read-only" member is a contradiction — they get full write access to EDA. A cron job that pulls log files should not hold that. Create a dedicated role, group, and user instead (roles attach to **groups**, never directly to users, so all three are needed):
 
 ```bash
-# role -> group -> user, via EDA's admin API as an administrator
+# role -> group -> user, via EDA's admin API as an administrator.
+# The role grants ONLY this endpoint: no resourceRules, no tableRules.
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$EDA/core/admin/roles" -d '{"name":"readonly","namespace":"eda-system",
-    "description":"Read-only access to all of EDA. No write anywhere.",
-    "resourceRules":[{"apiGroups":["*"],"resources":["*"],"permissions":"read"}],
-    "tableRules":[{"path":".**","permissions":"read"}],
-    "urlRules":[{"path":"/**","permissions":"read"}]}'
+  "$EDA/core/admin/roles" -d '{"name":"useraudit-reader","namespace":"eda-system",
+    "description":"Read the EDA User Audit log endpoint and nothing else.",
+    "urlRules":[{"path":"/core/httpproxy/v1/useraudit","permissions":"read"},
+                {"path":"/core/httpproxy/v1/useraudit/**","permissions":"read"}]}'
 
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$EDA/core/admin/groups" -d '{"name":"readonly","description":"Read-only across EDA."}'
-GUUID=$(curl -sk -H "Authorization: Bearer $TOKEN" "$EDA/core/admin/groups" | jq -r '.[]|select(.name=="readonly").uuid')
+  "$EDA/core/admin/groups" -d '{"name":"useraudit-readers","description":"Members may read the User Audit log endpoint only."}'
+GUUID=$(curl -sk -H "Authorization: Bearer $TOKEN" "$EDA/core/admin/groups" | jq -r '.[]|select(.name=="useraudit-readers").uuid')
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$EDA/core/admin/groups/$GUUID/roles" -d '["readonly"]'
+  "$EDA/core/admin/groups/$GUUID/roles" -d '["useraudit-reader"]'
 
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   "$EDA/core/admin/users" -d '{"username":"useraudit-readonly","email":"useraudit-readonly@eda.local",
@@ -149,7 +149,9 @@ EDA_USERNAME=useraudit-readonly EDA_PASSWORD=... EDA_CLIENT_SECRET=... \
   ./pull-audit-logs.sh https://<your-eda-host> /var/audit-archive
 ```
 
-Want the account restricted to *only* the audit log rather than read-only across EDA? Drop `resourceRules` and `tableRules` from the role above and narrow the URL rule to `/core/httpproxy/v1/useraudit/**`.
+That account can read the audit log and nothing else — verified on EDA 26.4.1: `403` on every EDA resource, on user administration, and on every write including resetting its own password. It can still list transaction *metadata* (`/core/transaction/v2/result/summary` — id, timestamp, username, success), because summaries are not URL-rule gated; anything carrying configuration content is, and returns `inputCrs: [], limitedAccess: true` or `403`. Those metadata fields are the same ones already in the audit log, so nothing extra is exposed.
+
+Want the account to read more of EDA instead, e.g. for a NOC login? Swap the role for a read-only-everything one: `resourceRules: [{apiGroups:[*], resources:[*], permissions:read}]`, `tableRules: [{path:.**, permissions:read}]`, `urlRules: [{path:/**, permissions:read}]`.
 
 EDA rules are additive with implicit deny, so the same mechanism widens access for any other group — no change to the app is needed:
 
