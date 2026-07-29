@@ -1,17 +1,75 @@
+# Kubernetes RBAC for the controller pod (NOT EDA RBAC -- see edarole.yaml).
+#
+# Scoped to exactly what build/controller/k8s.py calls. Until v26.4.1-12 this was
+# apiGroups/resources/verbs = ["*"], i.e. cluster-admin, which is how the pod could
+# read every Secret in the cluster. It now reads three Secrets by name and manages
+# only its own ConfigMap and its own CRD.
+#
+# Note on `create`: Kubernetes RBAC cannot restrict `create` by resourceNames (the
+# object does not exist yet), so the two create rules are unavoidably per-resource-type
+# rather than per-name. Every other verb is name-scoped.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: eda-useraudit
   namespace: eda-system
 ---
+# Namespaced permissions: Secrets and the state ConfigMap, in eda-system only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-useraudit
+  namespace: eda-system
+rules:
+  # eda-api-ca           -> TLS trust for the EDA API (auth.py:_build_ssl_context)
+  # keycloak-admin-secret-> one-time provisioning of the app's own Keycloak client
+  # eda-useraudit-client -> the app's own persisted client secret (runtime credential)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["eda-api-ca", "keycloak-admin-secret", "eda-useraudit-client"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["eda-useraudit-client"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["useraudit-state"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-useraudit
+  namespace: eda-system
+subjects:
+  - kind: ServiceAccount
+    name: eda-useraudit
+    namespace: eda-system
+roleRef:
+  kind: Role
+  name: eda-useraudit
+  apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-scoped permission: the app's own UserAuditConfig CRD is cluster-scoped
+# (manifest.yaml sets namespaced: false), so this cannot be a namespaced Role.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: eda-useraudit
 rules:
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["*"]
+  - apiGroups: ["useraudit.eda.edacommunity.com"]
+    resources: ["userauditconfigs"]
+    verbs: ["get", "create"]
+  - apiGroups: ["useraudit.eda.edacommunity.com"]
+    resources: ["userauditconfigs/status"]
+    verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

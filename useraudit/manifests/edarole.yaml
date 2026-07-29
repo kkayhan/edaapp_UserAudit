@@ -40,3 +40,37 @@ spec:
       permissions: read
     - path: /core/httpproxy/v1/useraudit/**
       permissions: read
+---
+# The role the CONTROLLER's own Keycloak service account holds.
+#
+# Until v26.4.1-12 the controller granted itself edarole_system-administrator --
+# readWrite on every resource, every EDB table and every URL -- even though it only
+# ever reads. This role is the same access, minus the ability to change anything and
+# minus every URL outside the transaction API.
+#
+# Creating this ClusterRole makes EDA create the matching Keycloak realm role
+# edarole_useraudit-controller, which is what the controller assigns to its service
+# account (see build/controller/auth.py:_EDA_ROLE).
+#
+# resourceRules must stay `* read`: EDA gates transaction detail on read access to a
+# transaction's INPUT resources, and any resource kind can appear in a transaction.
+# Narrowing this would silently blank out parts of the audit trail rather than fail
+# loudly. tableRules are omitted entirely -- the controller runs no EQL/EDB queries.
+apiVersion: core.eda.nokia.com/v1
+kind: ClusterRole
+metadata:
+  name: useraudit-controller
+  namespace: eda-system
+spec:
+  description: >-
+    Read-only access used by the EDA User Audit controller itself, to read
+    transaction results. Not intended for human users.
+  resourceRules:
+    - apiGroups: ["*"]
+      resources: ["*"]
+      permissions: read
+  urlRules:
+    # Covers summary, inputresources, execution, diffs/resource and diffs/nodecfg.
+    # Node config diffs specifically require a URL rule.
+    - path: /core/transaction/**
+      permissions: read

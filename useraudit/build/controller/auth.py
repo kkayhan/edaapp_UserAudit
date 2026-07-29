@@ -65,13 +65,29 @@ _KC_BASE = _KC_BASE_CANDIDATES[0]  # pinned by _ensure_kc_base() at first token 
 # _STORED_SECRET_NAME so that at runtime the app authenticates with ONLY that stored secret and
 # needs NO keycloak-admin-secret (KC master admin) — that is used only for one-time provisioning.
 _SVC_CLIENT_ID = "eda-useraudit"
-_EDA_ROLE = "edarole_system-administrator"  # the ONLY EDA realm role; the `admin` user has it too
+# The EDA realm role the service account holds. This is the Keycloak role that EDA
+# auto-creates from the `useraudit-controller` EDA ClusterRole shipped in
+# manifests/edarole.yaml: read-only on resources, and URL access limited to
+# /core/transaction/**.
+#
+# Up to v26.4.1-12 this was `edarole_system-administrator` -- readWrite on everything,
+# for an app that only reads. _ensure_service_client now also REVOKES that legacy role,
+# because granting the new one without removing the old would leave the account an
+# administrator and make the change cosmetic.
+_EDA_ROLE = "edarole_useraudit-controller"
+_LEGACY_EDA_ROLES = ["edarole_system-administrator"]
 # realm-management client roles the SA needs for the KC admin API. view-users is a composite that
 # also grants query-users/query-groups (covers /users + /groups); manage-realm covers enable-events
 # (PUT /admin/realms/eda); view-events covers /events + /admin-events. Verified sufficient on 26.4.1.
 _REALM_MGMT_ROLES = ["manage-realm", "view-events", "view-users"]
 _STORED_SECRET_NAME = "eda-useraudit-client"   # k8s Secret holding the SA client secret
 _STORED_SECRET_KEY = "clientSecret"
+# Marks which role profile the stored credential was provisioned under. The runtime
+# fast path deliberately skips provisioning, so without this an upgrade would keep
+# using the existing token and NEVER pick up a change to _EDA_ROLE -- the account
+# would stay an administrator forever. A mismatch forces exactly one re-provision.
+_STORED_PROFILE_KEY = "roleProfile"
+_ROLE_PROFILE = "v2-least-privilege"
 
 # Token cache: (token_string, expiry_epoch)
 _kc_admin_token_cache = [None, 0]
@@ -236,23 +252,30 @@ def _kc_admin_json(method, path, admin_token, body=None):
 
 
 def _get_stored_client_secret():
-    """Return the persisted service-account client secret from k8s (None if absent).
-    This is the runtime-preferred path — it needs NO KC master admin."""
+    """Return (secret, role_profile) from the persisted k8s Secret; (None, None) if absent.
+    This is the runtime-preferred path — it needs NO KC master admin.
+
+    role_profile records which _EDA_ROLE the credential was provisioned under, so an
+    upgrade that changes the role can force a single re-provision instead of silently
+    continuing with the old (over-privileged) grant."""
     try:
         data = k8s.read_secret(_STORED_SECRET_NAME, _NAMESPACE)
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return None
+            return None, None
         raise
-    val = (data or {}).get(_STORED_SECRET_KEY)
-    return val or None
+    data = data or {}
+    return (data.get(_STORED_SECRET_KEY) or None), (data.get(_STORED_PROFILE_KEY) or None)
 
 
 def _store_client_secret(secret):
     """Persist the service-account client secret so future runs authenticate without KC admin."""
     try:
-        k8s.create_or_update_secret(_STORED_SECRET_NAME, _NAMESPACE, {_STORED_SECRET_KEY: secret})
-        logger.info("Persisted service-account client secret to k8s secret %s", _STORED_SECRET_NAME)
+        k8s.create_or_update_secret(_STORED_SECRET_NAME, _NAMESPACE,
+                                    {_STORED_SECRET_KEY: secret,
+                                     _STORED_PROFILE_KEY: _ROLE_PROFILE})
+        logger.info("Persisted service-account client secret to k8s secret %s (role profile %s)",
+                    _STORED_SECRET_NAME, _ROLE_PROFILE)
     except Exception as e:
         # Non-fatal: the app still works this run (in-mem secret); it just re-provisions next start.
         logger.warning("Could not persist client secret to %s: %s", _STORED_SECRET_NAME, e)
@@ -282,6 +305,66 @@ def _ensure_realm_mgmt_roles(sa_id, admin_token):
     _kc_admin_json("POST", f"/admin/realms/eda/users/{sa_id}/role-mappings/clients/{rm_id}",
                    admin_token, to_grant)
     logger.info("Granted realm-management roles %s to service account of %s", missing, _SVC_CLIENT_ID)
+
+
+def _get_or_create_realm_role(name, admin_token):
+    """Return the Keycloak realm role `name`, creating it if it does not exist.
+
+    EDA creates `edarole_<x>` in Keycloak LAZILY — only when an administrator assigns
+    the EDA ClusterRole `<x>` to a user *group* through the EDA API. Shipping the
+    ClusterRole as a cr: component therefore does NOT produce a realm role. The
+    controller assigns its role directly to its own service account and no human ever
+    puts it on a group, so on a fresh install the role would simply not exist and every
+    provisioning attempt would fail.
+
+    Creating it here closes that gap. EDA authorizes on the NAME, so a realm role
+    created directly in Keycloak binds to the ClusterRole of the same name — verified
+    end to end on 26.4.1: with the role created this way and granted directly to a
+    principal, all of summary / inputresources / execution / diffs/nodecfg returned 200
+    with full content, while writes returned 403."""
+    try:
+        role = _kc_admin_json("GET", f"/admin/realms/eda/roles/{quote(name)}", admin_token)
+        if role and "id" in role:
+            return role
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    logger.info("Realm role %s absent — creating it (EDA only creates these lazily on "
+                "group assignment, and this one is bound directly to a service account)", name)
+    try:
+        _kc_admin_json("POST", "/admin/realms/eda/roles", admin_token, {
+            "name": name,
+            "description": ("Least-privilege role for the EDA User Audit controller. Bound to "
+                            "the useraudit-controller EDA ClusterRole shipped with the app."),
+        })
+    except urllib.error.HTTPError as e:
+        if e.code != 409:   # 409 = another replica/restart won the race; re-GET below
+            raise
+    role = _kc_admin_json("GET", f"/admin/realms/eda/roles/{quote(name)}", admin_token)
+    if not role or "id" not in role:
+        raise RuntimeError(f"Could not create or read realm role {name} in realm 'eda'")
+    return role
+
+
+def _revoke_legacy_roles(sa_id, admin_token, current_roles):
+    """Remove superseded, over-privileged realm roles from the service account.
+
+    Granting a narrower role without removing the old one leaves the account exactly as
+    privileged as before, so the tightening would be cosmetic. Best-effort: a failure to
+    revoke must not break auditing (the app still has the role it needs), it just leaves
+    the account broader than intended, which is logged loudly."""
+    stale = [r for r in current_roles if r.get("name") in _LEGACY_EDA_ROLES]
+    if not stale:
+        return
+    body = [{"id": r["id"], "name": r["name"]} for r in stale if r.get("id")]
+    try:
+        _kc_admin_json("DELETE", f"/admin/realms/eda/users/{sa_id}/role-mappings/realm",
+                       admin_token, body)
+        logger.info("Revoked legacy role(s) %s from service account of %s",
+                    [r["name"] for r in body], _SVC_CLIENT_ID)
+    except Exception as e:
+        logger.warning("Could not revoke legacy role(s) %s from %s (still holding them): %s",
+                       [r.get("name") for r in body], _SVC_CLIENT_ID, e)
 
 
 def _ensure_service_client(admin_token):
@@ -332,12 +415,15 @@ def _ensure_service_client(admin_token):
     have = _kc_admin_json("GET", f"/admin/realms/eda/users/{sa_id}/role-mappings/realm",
                           admin_token) or []
     if not any(r.get("name") == _EDA_ROLE for r in have):
-        role = _kc_admin_json("GET", f"/admin/realms/eda/roles/{quote(_EDA_ROLE)}", admin_token)
-        if not role or "id" not in role:
-            raise RuntimeError(f"Realm role {_EDA_ROLE} not found in realm 'eda'")
+        role = _get_or_create_realm_role(_EDA_ROLE, admin_token)
         _kc_admin_json("POST", f"/admin/realms/eda/users/{sa_id}/role-mappings/realm",
                        admin_token, [{"id": role["id"], "name": role["name"]}])
         logger.info("Granted %s to service account of %s", _EDA_ROLE, _SVC_CLIENT_ID)
+
+    # Drop any legacy over-privileged role. Ordered deliberately AFTER the grant above:
+    # if acquiring the new role failed we have already raised, so we can never strip the
+    # account's only means of access and leave it unable to read anything.
+    _revoke_legacy_roles(sa_id, admin_token, have)
 
     # 2b. Ensure the realm-management roles for the KC admin API (events/users/enable-events).
     _ensure_realm_mgmt_roles(sa_id, admin_token)
@@ -387,7 +473,19 @@ def get_eda_api_token(force=False, reprovision=False):
     resp = None
     # 1. Preferred: the stored/cached client secret — no KC admin involved.
     if not reprovision:
-        secret = _svc_client_secret_cache[0] or _get_stored_client_secret()
+        secret = _svc_client_secret_cache[0]
+        if not secret:
+            secret, profile = _get_stored_client_secret()
+            if secret and profile != _ROLE_PROFILE:
+                # Credential predates the current role profile (e.g. an upgrade that
+                # narrowed _EDA_ROLE). Re-provision once so the new grant — and the
+                # revocation of the old one — actually happen; the fast path would
+                # otherwise keep using the previously granted, broader identity.
+                logger.info("Stored credential has role profile %r, expected %r — "
+                            "re-provisioning %s once to apply the current roles",
+                            profile, _ROLE_PROFILE, _SVC_CLIENT_ID)
+                secret = None
+                reprovision = True
         if secret:
             _svc_client_secret_cache[0] = secret
             try:
