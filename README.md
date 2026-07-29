@@ -113,7 +113,45 @@ The app's HttpProxy uses `authType: inApiServer`, which makes the **EDA API serv
 1. **Authentication.** A valid Keycloak bearer token must be present. Without one the request is rejected with `HTTP 400 InvalidAuthHeader` — there is no anonymous access and no separate app password to manage.
 2. **Authorization.** EDA applies its own RBAC to the URL. Reaching `/core/httpproxy/v1/useraudit/**` requires a **URL rule** covering that path, and the only role shipped with a matching rule is the default `system-administrator` `ClusterRole` (`urlRules: [{path: /**, permissions: readWrite}]`). Roles are assigned through user groups, so in practice access means **membership of the `system-administrator` group**. Anyone else is authenticated but rejected with `HTTP 403`.
 
-EDA rules are additive with implicit deny, so if you want a non-admin group to read the audit log, create a `ClusterRole` with a narrow URL rule and assign it to that group — no change to the app is needed:
+**Give collectors their own account — not admin.** Membership of `system-administrator` cannot be attenuated: the group exists to carry a role granting `resourceRules: * readWrite` and `urlRules: /** readWrite`, so a "read-only" member is a contradiction — they get full write access to EDA. A cron job that pulls log files should not hold that. Create a dedicated role, group, and user instead (roles attach to **groups**, never directly to users, so all three are needed):
+
+```bash
+# role -> group -> user, via EDA's admin API as an administrator
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$EDA/core/admin/roles" -d '{"name":"readonly","namespace":"eda-system",
+    "description":"Read-only access to all of EDA. No write anywhere.",
+    "resourceRules":[{"apiGroups":["*"],"resources":["*"],"permissions":"read"}],
+    "tableRules":[{"path":".**","permissions":"read"}],
+    "urlRules":[{"path":"/**","permissions":"read"}]}'
+
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$EDA/core/admin/groups" -d '{"name":"readonly","description":"Read-only across EDA."}'
+GUUID=$(curl -sk -H "Authorization: Bearer $TOKEN" "$EDA/core/admin/groups" | jq -r '.[]|select(.name=="readonly").uuid')
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$EDA/core/admin/groups/$GUUID/roles" -d '["readonly"]'
+
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$EDA/core/admin/users" -d '{"username":"useraudit-readonly","email":"useraudit-readonly@eda.local",
+    "firstName":"UserAudit","lastName":"Reader","enabled":true}'
+UUUID=$(curl -sk -H "Authorization: Bearer $TOKEN" "$EDA/core/admin/users" | jq -r '.[]|select(.username=="useraudit-readonly").uuid')
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$EDA/core/admin/users/$UUUID/groups" -d "[\"$GUUID\"]"
+curl -sk -X PUT  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$EDA/core/admin/users/$UUUID/resetpassword" -d '{"value":"<password>","temporary":false}'
+```
+
+The same is available in the UI under **System Administration → User Management**. Each of these returns `400` if you try to shortcut it: a group cannot be created with `roles`, a user cannot be created with `groups` or `password`, `email`/`firstName`/`lastName` are mandatory, and Keycloak rejects punctuation (e.g. parentheses) in first/last names.
+
+The collector then needs no Keycloak admin credentials — only the account and the `eda` client secret:
+
+```bash
+EDA_USERNAME=useraudit-readonly EDA_PASSWORD=... EDA_CLIENT_SECRET=... \
+  ./pull-audit-logs.sh https://<your-eda-host> /var/audit-archive
+```
+
+Want the account restricted to *only* the audit log rather than read-only across EDA? Drop `resourceRules` and `tableRules` from the role above and narrow the URL rule to `/core/httpproxy/v1/useraudit/**`.
+
+EDA rules are additive with implicit deny, so the same mechanism widens access for any other group — no change to the app is needed:
 
 ```yaml
 apiVersion: core.eda.nokia.com/v1
