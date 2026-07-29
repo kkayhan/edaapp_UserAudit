@@ -5,4 +5,13 @@ metadata:
   namespace: eda-system
 spec:
   rootUrl: http://eda-useraudit-fileserver.eda-system.svc:8080/
-  authType: atDestination
+  # inApiServer: the EDA API server authenticates the caller (Keycloak bearer token
+  # required) AND authorizes the request against EDA RBAC before forwarding, then
+  # strips the token. A URL rule is required to reach this path, and only the default
+  # `system-administrator` ClusterRole carries one (`/**`, readWrite) — so access is
+  # limited to members of the `system-administrator` user group.
+  #
+  # atDestination (used up to v26.4.1-10) does the opposite: it authenticates NOTHING
+  # and forwards the request as-is, which left the audit log world-readable to anyone
+  # who could reach the EDA address.
+  authType: inApiServer

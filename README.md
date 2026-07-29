@@ -68,10 +68,28 @@ Logs live on a `PersistentVolumeClaim` inside the cluster (`useraudit-data`, 500
 
 Logs are served read-only over the EDA HttpProxy at `https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/`.
 
+**Who can read them.** EDA authenticates and authorizes every request before it reaches the app, and only members of the **`system-administrator`** user group are allowed through. See [Access control](#access-control) for how that works and how to widen it.
+
+**Step 0 — get an access token.** Every call needs an EDA bearer token. This is the standard [EDA API authentication flow](https://docs.eda.dev/development/api/#getting-the-access-token): ask an EDA administrator for the Keycloak client secret of the `eda` client, then exchange your own EDA username and password for a token.
+
+```bash
+EDA=https://<your-eda-host>
+TOKEN=$(curl -sk "$EDA/core/httpproxy/v1/keycloak/realms/eda/protocol/openid-connect/token" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'grant_type=password' \
+  --data-urlencode 'client_id=eda' \
+  --data-urlencode 'scope=openid' \
+  --data-urlencode "client_secret=$EDA_CLIENT_SECRET" \
+  --data-urlencode "username=$EDA_USERNAME" \
+  --data-urlencode "password=$EDA_PASSWORD" | jq -r .access_token)
+```
+
+Tokens are short-lived (~5 minutes by default), so acquire one per run rather than storing it. On some deployments Keycloak is routed at `/core/proxy/v1/identity` instead of `/core/httpproxy/v1/keycloak` — if the first path 404s, try the other. The helper script below handles all of this for you.
+
 **Step 1 — list the available log files.** A `GET` on `/logs/` returns a JSON array of every file currently on disk, with sizes and timestamps:
 
 ```bash
-curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
+curl -sk -H "Authorization: Bearer $TOKEN" https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
 ```
 
 ```json
@@ -84,8 +102,36 @@ curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/
 **Step 2 — download a specific file.** Append the `name` from the listing to the URL:
 
 ```bash
-curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/EDA-user-events-2026-05-04.log
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://<your-eda-host>/core/httpproxy/v1/useraudit/logs/EDA-user-events-2026-05-04.log
 ```
+
+### Access control
+
+The app's HttpProxy uses `authType: inApiServer`, which makes the **EDA API server** the enforcement point. Two checks run there, before a request ever reaches the app:
+
+1. **Authentication.** A valid Keycloak bearer token must be present. Without one the request is rejected with `HTTP 400 InvalidAuthHeader` — there is no anonymous access and no separate app password to manage.
+2. **Authorization.** EDA applies its own RBAC to the URL. Reaching `/core/httpproxy/v1/useraudit/**` requires a **URL rule** covering that path, and the only role shipped with a matching rule is the default `system-administrator` `ClusterRole` (`urlRules: [{path: /**, permissions: readWrite}]`). Roles are assigned through user groups, so in practice access means **membership of the `system-administrator` group**. Anyone else is authenticated but rejected with `HTTP 403`.
+
+EDA rules are additive with implicit deny, so if you want a non-admin group to read the audit log, create a `ClusterRole` with a narrow URL rule and assign it to that group — no change to the app is needed:
+
+```yaml
+apiVersion: core.eda.nokia.com/v1
+kind: ClusterRole
+metadata:
+  name: audit-log-reader
+  namespace: eda-system
+spec:
+  description: Read-only access to the EDA User Audit log endpoint.
+  urlRules:
+    - path: /core/httpproxy/v1/useraudit/**
+      permissions: read
+```
+
+Two consequences worth knowing:
+
+- **The token is stripped before forwarding.** The app never sees who called it, so it cannot record log-download activity in its own audit trail. Read access is visible in EDA/Keycloak, not in the log files.
+- **Browsers cannot open the URL directly.** EDA accepts the token only in an `Authorization` header — not a cookie, not a query parameter — so pasting the URL into a browser returns `HTTP 400` rather than a login page. Access is via `curl`, the helper script, or any SIEM/collector that can set a header.
 
 ### Need SFTP? Relay it from outside the cluster
 
@@ -99,23 +145,25 @@ The pattern is a small cron job on any Linux host that can reach EDA over HTTPS:
 
 ### Helper script
 
-[`logs/pull-audit-logs.sh`](logs/pull-audit-logs.sh) wraps both steps so you can grab everything in one command. Pure `bash` + `curl`, no other dependencies:
+[`logs/pull-audit-logs.sh`](logs/pull-audit-logs.sh) wraps all three steps — token acquisition included — so you can grab everything in one command. Pure `bash` + `curl`, no other dependencies:
 
 ```bash
 # Download every log file into the current directory
-./pull-audit-logs.sh https://<your-eda-host>
+EDA_USERNAME=admin EDA_PASSWORD=... ./pull-audit-logs.sh https://<your-eda-host>
 
 # Download every log file into ./audit-archive
-./pull-audit-logs.sh https://<your-eda-host> ./audit-archive
+EDA_USERNAME=admin EDA_PASSWORD=... ./pull-audit-logs.sh https://<your-eda-host> ./audit-archive
 
 # Download a single named file
-./pull-audit-logs.sh https://<your-eda-host> ./audit-archive EDA-user-events-2026-05-04.log
+EDA_USERNAME=admin EDA_PASSWORD=... ./pull-audit-logs.sh https://<your-eda-host> ./audit-archive EDA-user-events-2026-05-04.log
 ```
+
+Credentials come from the environment: `EDA_USERNAME` / `EDA_PASSWORD` (the EDA user to log in as — must be in the `system-administrator` group), and optionally `EDA_CLIENT_SECRET`. If you don't supply the client secret the script fetches it for you using `KC_USERNAME` / `KC_PASSWORD` (the Keycloak master-realm admin). Already hold a token? Set `EDA_TOKEN` and no other credential is read. The script locates Keycloak itself and re-acquires the token mid-run if it expires.
 
 ### Health check
 
 ```bash
-curl -sk https://<your-eda-host>/core/httpproxy/v1/useraudit/healthz
+curl -sk -H "Authorization: Bearer $TOKEN" https://<your-eda-host>/core/httpproxy/v1/useraudit/healthz
 ```
 
 Returns a JSON object with overall status, last poll time, last transaction ID processed, and per-subsystem health for the EDA API and Keycloak event feeds.
@@ -439,5 +487,6 @@ Sign in fresh from a browser, then pull the latest audit log:
 ## What it does NOT do
 
 - Does **not** forward logs to external systems (syslog / SIEM / S3). Pull logs over HTTP into whatever system you already run.
-- Does **not** require (or accept) any credentials — it reads existing Kubernetes secrets inside the cluster.
-- Does **not** filter log access per user. Anyone authenticated to EDA can read the audit log.
+- Does **not** require (or accept) any credentials of its own — it reads existing Kubernetes secrets inside the cluster, and log access is authenticated by EDA rather than by an app-local password.
+- Does **not** implement per-file or per-user filtering of its own. Access is all-or-nothing and enforced by EDA RBAC: a caller who is allowed to reach the endpoint can read every log file. Restricting *which* logs a reader sees is not supported.
+- Does **not** log who downloaded a log file. EDA strips the caller's token before forwarding, so the app cannot see the reader's identity; read access is visible in EDA and Keycloak instead.
