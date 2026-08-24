@@ -23,7 +23,10 @@ which 404s forever on deployments routing KC at /core/proxy/v1/identity), a fail
 never pinned (re-probes next call instead of wedging on a transient eda-api outage), and any 403
 triggers a one-shot re-provision so stripped roles are re-granted (self-heal parity with -3).
 
-Builds an SSLContext from the EDA internal trust bundle + eda-api-ca secret.
+Builds an SSLContext from the EDA internal trust bundle + eda-api-ca secret. v26.4.1-14
+reloads that trust on demand: cert-manager rotates the eda-api CA on a ~90-day cycle, and a
+context built once at startup silently stops verifying weeks later, when the first leaf signed
+by the new CA is issued (see _with_tls_retry).
 """
 
 import json
@@ -95,12 +98,21 @@ _eda_api_token_cache = [None, 0]
 _svc_client_secret_cache = [None]   # in-mem cache of the dedicated service-account client secret
 _kc_base_cache = [None]   # set once _ensure_kc_base() pins the working Keycloak base
 
-# SSL context singleton
+# SSL context singleton. _ssl_ctx_built_at gates how often the CA material may be re-read
+# (see invalidate_ssl_context).
 _ssl_context = [None]
+_ssl_ctx_built_at = [0.0]
+_SSL_REBUILD_MIN_INTERVAL = 60   # seconds
 
 
-def _build_ssl_context():
-    """Build SSLContext from trust bundle + eda-api-ca secret."""
+def _build_ssl_context(allow_insecure_fallback=True):
+    """Build an SSLContext from the internal trust bundle + the eda-api-ca secret.
+
+    allow_insecure_fallback is True ONLY for the first build at startup, preserving the
+    long-standing behaviour of coming up degraded rather than not at all. On a RELOAD it
+    must be False: a transient k8s API failure would otherwise silently downgrade a
+    running production app to unverified TLS.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     loaded = False
     # Load internal trust bundle
@@ -125,6 +137,8 @@ def _build_ssl_context():
     except Exception as e:
         logger.warning("Failed to load eda-api-ca: %s", e)
     if not loaded:
+        if not allow_insecure_fallback:
+            raise RuntimeError("no CA certificates could be loaded")
         logger.warning("No CA certificates loaded; falling back to unverified TLS")
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -133,8 +147,73 @@ def _build_ssl_context():
 
 def get_ssl_context():
     if _ssl_context[0] is None:
-        _ssl_context[0] = _build_ssl_context()
+        _ssl_context[0] = _build_ssl_context(allow_insecure_fallback=True)
+        _ssl_ctx_built_at[0] = time.time()
     return _ssl_context[0]
+
+
+def invalidate_ssl_context():
+    """Re-read the CA material and install a fresh SSLContext. True if one was installed.
+
+    Rate-limited to one attempt per _SSL_REBUILD_MIN_INTERVAL so an unreachable peer cannot
+    turn every call into a k8s Secret read. The existing context is kept when the rebuild
+    fails, so a failed reload can never leave the app without trust -- or with weaker trust
+    than it already had.
+    """
+    now = time.time()
+    if now - _ssl_ctx_built_at[0] < _SSL_REBUILD_MIN_INTERVAL:
+        return False
+    try:
+        ctx = _build_ssl_context(allow_insecure_fallback=False)
+    except Exception as e:
+        _ssl_ctx_built_at[0] = now          # rate-limit failed attempts too
+        logger.warning("CA reload failed, keeping the current TLS trust: %s", e)
+        return False
+    _ssl_context[0] = ctx
+    _ssl_ctx_built_at[0] = now
+    logger.info("TLS trust material reloaded from trust bundle + eda-api-ca")
+    return True
+
+
+def _is_cert_verify_error(exc):
+    """True when exc IS, or WRAPS, a certificate-verification failure.
+
+    urllib raises URLError(reason=SSLCertVerificationError), so testing only the outer
+    exception type misses every real occurrence.
+    """
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    return isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError)
+
+
+def _with_tls_retry(fn):
+    """Run fn(); on a certificate-verification failure reload the CA material once and
+    retry fn exactly once.
+
+    WHY (v26.4.1-14): cert-manager rotates the eda-api CA on a ~90-day cycle and the
+    eda-api leaf on ~30 days. Trust was read once at startup, so a long-lived pod kept
+    working after the CA rotated -- eda-api was still serving its older leaf -- and then
+    failed EVERY outbound call (EDA API and Keycloak alike, Keycloak being proxied through
+    eda-api) the moment the first leaf signed by the new CA appeared. On a customer 26.4.1
+    that delay was 12 days, and the app was blind for 43.7 h while the pod reported
+    1/1 Running with 0 restarts.
+
+    fn MUST resolve get_ssl_context() itself on every attempt. A context hoisted by the
+    caller would make the retry reuse the dead one -- which is why http_json() and
+    _http_post_form() no longer take an ssl_ctx argument.
+    """
+    try:
+        return fn()
+    except urllib.error.URLError as e:
+        # HTTPError subclasses URLError but never carries an SSL reason, so it falls
+        # straight through to the caller's own 401/403/404 handling.
+        if not _is_cert_verify_error(e):
+            raise
+        logger.warning("TLS certificate verification failed (%s) -- reloading CA material "
+                       "and retrying once", getattr(e, "reason", e))
+        if not invalidate_ssl_context():
+            raise
+        return fn()
 
 
 _PROBE_TIMEOUT = 8   # probes run serially over up to 3 candidates; keep an outage cheap
@@ -153,55 +232,85 @@ def _ensure_kc_base():
     global _KC_BASE
     if _kc_base_cache[0]:
         return
-    ctx = get_ssl_context()
-    for base in _KC_BASE_CANDIDATES:
-        url = f"{base}/realms/master/.well-known/openid-configuration"
-        try:
-            with urlopen(Request(url=url, method="GET"), context=ctx, timeout=_PROBE_TIMEOUT) as resp:
-                if 200 <= resp.status < 300:
-                    _KC_BASE = base
-                    _kc_base_cache[0] = base
-                    logger.info("Keycloak base discovered: %s", base)
-                    return
-                logger.info("Keycloak base probe %s -> HTTP %s", url, resp.status)
-        except urllib.error.HTTPError as e:
-            logger.info("Keycloak base probe %s -> HTTP %s", url, e.code)
-        except Exception as e:
-            logger.info("Keycloak base probe %s -> %s", url, e)
+
+    cert_error = [False]
+
+    def _probe_round():
+        """Pin the first candidate answering 2xx; True if one was pinned. Records whether any
+        candidate failed TLS verification -- a rotated CA fails every candidate identically,
+        which would otherwise be reported as 'no base found' rather than a trust problem."""
+        global _KC_BASE
+        cert_error[0] = False
+        for base in _KC_BASE_CANDIDATES:
+            url = f"{base}/realms/master/.well-known/openid-configuration"
+            try:
+                with urlopen(Request(url=url, method="GET"),
+                             context=get_ssl_context(), timeout=_PROBE_TIMEOUT) as resp:
+                    if 200 <= resp.status < 300:
+                        _KC_BASE = base
+                        _kc_base_cache[0] = base
+                        logger.info("Keycloak base discovered: %s", base)
+                        return True
+                    logger.info("Keycloak base probe %s -> HTTP %s", url, resp.status)
+            except urllib.error.HTTPError as e:
+                logger.info("Keycloak base probe %s -> HTTP %s", url, e.code)
+            except Exception as e:
+                if _is_cert_verify_error(e):
+                    cert_error[0] = True
+                logger.info("Keycloak base probe %s -> %s", url, e)
+        return False
+
+    if _probe_round():
+        return
+    # Probes run before any token call, so this is where a rotated CA is met first.
+    if cert_error[0] and invalidate_ssl_context() and _probe_round():
+        return
     logger.warning("No Keycloak base probe succeeded; using default %s for this attempt "
                    "(unpinned — will re-probe on the next call)", _KC_BASE)
 
 
-def _http_post_form(url, fields, ssl_ctx):
+def _http_post_form(url, fields):
+    """POST a form. The SSL context is resolved per attempt so a CA reload can take effect."""
     data = urlencode(fields).encode("utf-8")
-    req = Request(url=url, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        with urlopen(req, context=ssl_ctx, timeout=_TIMEOUT) as resp:
-            raw = resp.read()
-            return json.loads(raw.decode("utf-8")) if raw else None
-    except urllib.error.HTTPError as e:
-        logger.warning("POST %s -> HTTP %s", url, e.code)
-        raise
+
+    def _attempt():
+        req = Request(url=url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urlopen(req, context=get_ssl_context(), timeout=_TIMEOUT) as resp:
+                raw = resp.read()
+                return json.loads(raw.decode("utf-8")) if raw else None
+        except urllib.error.HTTPError as e:
+            logger.warning("POST %s -> HTTP %s", url, e.code)
+            raise
+
+    return _with_tls_retry(_attempt)
 
 
-def http_json(method, url, headers, data, ssl_ctx):
-    """Generic HTTP JSON request used by other modules."""
-    req = Request(url=url, data=data, method=method)
-    for k, v in headers.items():
-        req.add_header(k, v)
-    try:
-        with urlopen(req, context=ssl_ctx, timeout=_TIMEOUT) as resp:
-            raw = resp.read()
-            return json.loads(raw.decode("utf-8")) if raw else None
-    except urllib.error.HTTPError as e:
-        # 404 is expected/handled by callers (e.g. the per-id transaction look-ahead
-        # scan probes ids that don't exist yet) -> debug, not warning. Surface 5xx.
-        if e.code >= 500:
-            logger.warning("%s %s -> HTTP %s", method, url, e.code)
-        else:
-            logger.debug("%s %s -> HTTP %s", method, url, e.code)
-        raise
+def http_json(method, url, headers, data):
+    """Generic HTTP JSON request used by other modules.
+
+    Takes NO ssl_ctx: the context is resolved per attempt so a CA reload can take effect.
+    A caller-hoisted context would silently defeat _with_tls_retry (it would retry with the
+    same dead context), which is exactly the trap this signature removes."""
+    def _attempt():
+        req = Request(url=url, data=data, method=method)
+        for k, v in headers.items():
+            req.add_header(k, v)
+        try:
+            with urlopen(req, context=get_ssl_context(), timeout=_TIMEOUT) as resp:
+                raw = resp.read()
+                return json.loads(raw.decode("utf-8")) if raw else None
+        except urllib.error.HTTPError as e:
+            # 404 is expected/handled by callers (e.g. the per-id transaction look-ahead
+            # scan probes ids that don't exist yet) -> debug, not warning. Surface 5xx.
+            if e.code >= 500:
+                logger.warning("%s %s -> HTTP %s", method, url, e.code)
+            else:
+                logger.debug("%s %s -> HTTP %s", method, url, e.code)
+            raise
+
+    return _with_tls_retry(_attempt)
 
 
 def _kc_token_url(realm):
@@ -227,7 +336,7 @@ def get_kc_admin_token(force=False):
         "client_id": "admin-cli",
         "username": username,
         "password": password,
-    }, get_ssl_context())
+    })
 
     if not resp or "access_token" not in resp:
         raise RuntimeError("KC admin auth failed: no access_token")
@@ -248,7 +357,7 @@ def _kc_admin_json(method, path, admin_token, body=None):
     headers = {"Authorization": f"Bearer {admin_token}", "Accept": "application/json"}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    return http_json(method, url, headers, data, get_ssl_context())
+    return http_json(method, url, headers, data)
 
 
 def _get_stored_client_secret():
@@ -444,7 +553,7 @@ def _client_credentials(secret):
         "grant_type": "client_credentials",
         "client_id": _SVC_CLIENT_ID,
         "client_secret": secret,
-    }, get_ssl_context())
+    })
 
 
 def get_eda_api_token(force=False, reprovision=False):
@@ -558,11 +667,10 @@ def eda_api_get(path_qs):
     (role drift: a valid stored secret whose SA lost its roles — re-provision re-grants them)."""
     url = _EDA_API_BASE.rstrip("/") + "/" + path_qs.lstrip("/")
     token = _token()
-    ssl_ctx = get_ssl_context()
     try:
         return http_json("GET", url,
                          {"Accept": "application/json", "Authorization": f"Bearer {token}"},
-                         None, ssl_ctx)
+                         None)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             logger.warning("EDA API 401 — refreshing token and retrying")
@@ -577,7 +685,7 @@ def eda_api_get(path_qs):
             raise
         return http_json("GET", url,
                          {"Accept": "application/json", "Authorization": f"Bearer {token}"},
-                         None, ssl_ctx)
+                         None)
 
 
 def kc_admin_get(path):
@@ -587,13 +695,12 @@ def kc_admin_get(path):
 
     NOTE: the URL is built AFTER the first token acquisition — get_eda_api_token() runs
     _ensure_kc_base(), and on the first call of the process _KC_BASE may change under us."""
-    ssl_ctx = get_ssl_context()
     token = _token()                     # pins the KC base before we read _KC_BASE
     url = _KC_BASE + path
     try:
         return http_json("GET", url,
                          {"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                         None, ssl_ctx)
+                         None)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             logger.warning("KC admin 401 — refreshing service-account token and retrying")
@@ -608,23 +715,25 @@ def kc_admin_get(path):
             raise
         return http_json("GET", url,
                          {"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                         None, ssl_ctx)
+                         None)
 
 
 def kc_admin_put(path, body_dict):
     """PUT against the KC admin API with the service-account token (needs manage-realm).
     Same 401/403 retry semantics — and same URL-after-token ordering — as kc_admin_get."""
-    ssl_ctx = get_ssl_context()
     data = json.dumps(body_dict).encode("utf-8")
     token = _token()                     # pins the KC base before we read _KC_BASE
     url = _KC_BASE + path
 
     def _put(tok):
-        req = Request(url=url, data=data, method="PUT")
-        req.add_header("Authorization", f"Bearer {tok}")
-        req.add_header("Content-Type", "application/json")
-        with urlopen(req, context=ssl_ctx, timeout=_TIMEOUT) as resp:
-            resp.read()
+        def _attempt():
+            req = Request(url=url, data=data, method="PUT")
+            req.add_header("Authorization", f"Bearer {tok}")
+            req.add_header("Content-Type", "application/json")
+            with urlopen(req, context=get_ssl_context(), timeout=_TIMEOUT) as resp:
+                resp.read()
+
+        return _with_tls_retry(_attempt)
 
     try:
         _put(token)
