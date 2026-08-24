@@ -204,15 +204,26 @@ def _with_tls_retry(fn):
     """
     try:
         return fn()
-    except urllib.error.URLError as e:
-        # HTTPError subclasses URLError but never carries an SSL reason, so it falls
-        # straight through to the caller's own 401/403/404 handling.
+    except (urllib.error.URLError, ssl.SSLCertVerificationError) as e:
+        # HTTPError subclasses URLError but never carries an SSL reason, so it falls straight
+        # through to the caller's own 401/403/404 handling. The bare SSLCertVerificationError
+        # arm covers TLS raised outside urlopen's URLError wrapper -- without it the bare-error
+        # branch of _is_cert_verify_error is unreachable from here.
         if not _is_cert_verify_error(e):
             raise
-        logger.warning("TLS certificate verification failed (%s) -- reloading CA material "
-                       "and retrying once", getattr(e, "reason", e))
+        reason = getattr(e, "reason", e)
+        # Log what ACTUALLY happened. invalidate_ssl_context() is rate-limited, so the reload is
+        # frequently suppressed (every call inside one poll cycle after the first). Announcing a
+        # reload BEFORE checking -- as v26.4.1-14 did -- writes a remediation into the log that
+        # never ran: on the Talos lab it claimed 6 reloads where exactly 1 occurred, which
+        # misdirects the very investigation this feature exists to support.
         if not invalidate_ssl_context():
+            logger.warning("TLS certificate verification failed (%s); CA reload SUPPRESSED "
+                           "(trust re-read < %ds ago) -- not retrying", reason,
+                           _SSL_REBUILD_MIN_INTERVAL)
             raise
+        logger.warning("TLS certificate verification failed (%s) -- CA material reloaded, "
+                       "retrying once", reason)
         return fn()
 
 
