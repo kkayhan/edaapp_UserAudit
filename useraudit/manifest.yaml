@@ -21,9 +21,9 @@ spec:
     logging automatically upon installation with no additional
     setup required.
   author: EDACommunity
-  image: ghcr.io/kkayhan/eda-catalog/useraudit-app:v26.4.1-15
+  image: ghcr.io/kkayhan/eda-catalog/useraudit-app:v26.8.2-1
   supportedCoreVersions:
-    - "v5.0.0-0"
+    - "v6.0.0"
   appInfo:
     categories:
       - monitoring
